@@ -728,6 +728,37 @@ class Game:
         for o in self.orbs:
             o.update(dt, self.player)
 
+        # enemy-enemy separation to prevent stacking
+        if len(self.enemies) > 1:
+            for _ in range(2):  # a couple of relaxation passes
+                for i in range(len(self.enemies)):
+                    ei = self.enemies[i]
+                    for j in range(i + 1, len(self.enemies)):
+                        ej = self.enemies[j]
+                        dx = ej.x - ei.x
+                        dy = ej.y - ei.y
+                        dist = math.hypot(dx, dy)
+                        min_dist = ei.radius + ej.radius
+                        if dist < 1e-4:
+                            dx = random.uniform(-0.01, 0.01)
+                            dy = random.uniform(-0.01, 0.01)
+                            dist = math.hypot(dx, dy) or 1.0
+                        if dist < min_dist:
+                            overlap = (min_dist - dist)
+                            nx, ny = dx / dist, dy / dist
+                            # bosses resist being pushed; regulars share the shove
+                            wi = 0.5
+                            wj = 0.5
+                            if getattr(ei, "kind", "") == "boss" and getattr(ej, "kind", "") != "boss":
+                                wi, wj = 0.2, 0.8
+                            elif getattr(ej, "kind", "") == "boss" and getattr(ei, "kind", "") != "boss":
+                                wi, wj = 0.8, 0.2
+                            push = overlap * 0.5
+                            ei.x -= nx * push * wi
+                            ei.y -= ny * push * wi
+                            ej.x += nx * push * wj
+                            ej.y += ny * push * wj
+
         # aura damage around the player
         if self.player.aura_radius > 0 and self.player.aura_dps > 0:
             rad_sq = self.player.aura_radius * self.player.aura_radius
@@ -812,7 +843,7 @@ class Game:
                     dx = self.player.x - en.x
                     dy = self.player.y - en.y
                     l = math.hypot(dx, dy) or 1
-                    speed = 5.0 if en.kind != "boss" else 7.0
+                    speed = 5.0 if en.kind != "boss" else 12.0
                     self.enemy_bullets.append({"x": en.x, "y": en.y, "vx": dx / l * speed, "vy": dy / l * speed, "r": 6 if en.kind == "boss" else 4, "dmg": 1})
 
         # enemy bullets update/collisions
@@ -832,10 +863,11 @@ class Game:
         # bullet-enemy
         for b in list(self.bullets):
             for en in list(self.enemies):
-                if getattr(en, "hit_iframes", 0.0) > 0:
+                if en.hit_sources.get(getattr(b, "uid", None), 0.0) > 0:
                     continue
                 if circle_collision(b.x, b.y, b.radius, en.x, en.y, en.radius):
-                    en.hit_iframes = 0.15
+                    if hasattr(b, "uid"):
+                        en.hit_sources[b.uid] = 0.22
                     b.guidance_disabled = True
                     b.target = None
                     extra_damage = 0
@@ -846,8 +878,13 @@ class Game:
                     dy = en.y - b.y
                     l = math.hypot(dx, dy) or 1
                     push = 12
+                    if getattr(en, "kind", "") == "boss":
+                        push *= 0.25
                     en.x += dx / l * push
                     en.y += dy / l * push
+                    if getattr(en, "kind", "") != "boss":
+                        en.knockback_pause = 0.2
+                        en.knockback_slow = 0.2
                     # status bonus damage
                     if b.status.get("ice") and en.ice_timer > 0:
                         extra_damage += self.player.ice_bonus_damage
@@ -1179,7 +1216,7 @@ class Game:
             ox, oy = orb.get("x", self.player.x), orb.get("y", self.player.y)
             radius = hit_r
             for en in list(self.enemies):
-                if getattr(en, "aura_iframes", 0) > 0:
+                if en.hit_sources.get(orb.get("uid"), 0.0) > 0:
                     continue
                 dx = en.x - ox
                 dy = en.y - oy
@@ -1187,11 +1224,17 @@ class Game:
                     en.hp -= self.player.aura_orb_damage
                     en.flash_timer = 0.1
                     en.aura_iframes = 0.25
+                    en.hit_sources[orb.get("uid")] = 0.2
+                    if getattr(en, "kind", "") != "boss":
+                        en.knockback_pause = 0.2
+                        en.knockback_slow = 0.2
                     # knockback away from the player position
                     kx = en.x - self.player.x
                     ky = en.y - self.player.y
                     kl = math.hypot(kx, ky) or 1.0
                     push = self.player.aura_orb_knockback
+                    if getattr(en, "kind", "") == "boss":
+                        push *= 0.2
                     en.x += kx / kl * push
                     en.y += ky / kl * push
 

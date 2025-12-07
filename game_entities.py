@@ -22,7 +22,11 @@ from game_constants import (
 
 
 class Bullet:
+    _uid = 0
+
     def __init__(self, x, y, vx, vy, damage, speed, status=None):
+        Bullet._uid += 1
+        self.uid = Bullet._uid
         self.x = x
         self.y = y
         l = math.hypot(vx, vy) or 1
@@ -69,8 +73,10 @@ class Enemy:
         self.kind = kind
         self.boss_stage = boss_stage
         self.flash_timer = 0.0
-        self.hit_iframes = 0.0
         self.aura_iframes = 0.0
+        self.hit_sources = {}
+        self.knockback_pause = 0.0
+        self.knockback_slow = 0.0
         self.ice_timer = 0.0
         self.burn_timer = 0.0
         self.poison_timer = 0.0
@@ -84,10 +90,22 @@ class Enemy:
     def update(self, dt, player_pos):
         if self.flash_timer > 0:
             self.flash_timer -= dt
-        if self.hit_iframes > 0:
-            self.hit_iframes -= dt
         if self.aura_iframes > 0:
             self.aura_iframes -= dt
+        if self.knockback_pause > 0:
+            self.knockback_pause -= dt
+        if self.knockback_slow > 0:
+            self.knockback_slow -= dt
+        if self.hit_sources:
+            expired = []
+            for k, v in self.hit_sources.items():
+                nv = v - dt
+                if nv <= 0:
+                    expired.append(k)
+                else:
+                    self.hit_sources[k] = nv
+            for k in expired:
+                self.hit_sources.pop(k, None)
         if self.ice_timer > 0:
             self.ice_timer -= dt
         if self.burn_timer > 0:
@@ -104,7 +122,13 @@ class Enemy:
         dx = px - self.x
         dy = py - self.y
         l = math.hypot(dx, dy) or 1
-        speed_mult = 0.55 if self.ice_timer > 0 else 1.0
+        if self.knockback_pause > 0:
+            return
+        speed_mult = 1.0
+        if self.ice_timer > 0:
+            speed_mult *= 0.55
+        if self.knockback_slow > 0:
+            speed_mult *= 0.55
         self.x += dx / l * self.speed * speed_mult * dt * FPS
         self.y += dy / l * self.speed * speed_mult * dt * FPS
 
@@ -546,4 +570,4 @@ class Player:
         for i in range(self.aura_orb_count):
             ang = math.tau * i / self.aura_orb_count
             elem = elements[i % len(elements)]
-            self.aura_orbs.append({"angle": ang, "element": elem, "x": 0.0, "y": 0.0, "cd": 0.0})
+            self.aura_orbs.append({"angle": ang, "element": elem, "x": 0.0, "y": 0.0, "cd": 0.0, "uid": i + 1})
