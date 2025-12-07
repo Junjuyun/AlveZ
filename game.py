@@ -51,7 +51,7 @@ XP_LEVEL_GROWTH = 1.45   # each level needs ~45% more XP
 SCREEN_SHAKE_DECAY = 3.0
 
 # increase star density
-STAR_COUNT = 8500
+STAR_COUNT = 12000
 
 # powerup gating
 POWERUP_FIRST = 1      # first level-up gives powerup
@@ -104,7 +104,7 @@ class Button:
 
 
 class Bullet:
-    def __init__(self, x, y, vx, vy, damage, speed):
+    def __init__(self, x, y, vx, vy, damage, speed, status=None):
         self.x = x
         self.y = y
         l = math.hypot(vx, vy) or 1
@@ -114,6 +114,7 @@ class Bullet:
         self.radius = BULLET_RADIUS
         self.piercing = False
         self.pierce_left = 0
+        self.status = status or {}
 
     def update(self, dt):
         self.x += self.vx * dt * FPS
@@ -138,16 +139,40 @@ class Enemy:
         self.y = y
         self.hp = hp
         self.speed = speed
-        self.radius = ENEMY_RADIUS
+        base_r = ENEMY_RADIUS
+        if kind == "boss":
+            base_r = int(ENEMY_RADIUS * 2.2)
+        elif kind == "bruiser":
+            base_r = int(ENEMY_RADIUS * 1.4)
+        elif kind == "sprinter":
+            base_r = int(ENEMY_RADIUS * 0.9)
+        self.radius = base_r
         self.kind = kind
+        self.flash_timer = 0.0
+        self.ice_timer = 0.0
+        self.burn_timer = 0.0
+        self.poison_timer = 0.0
+        self.burn_dps = 0.0
+        self.poison_dps = 0.0
 
     def update(self, dt, player_pos):
+        if self.flash_timer > 0:
+            self.flash_timer -= dt
+        if self.ice_timer > 0:
+            self.ice_timer -= dt
+        if self.burn_timer > 0:
+            self.burn_timer -= dt
+            self.hp -= self.burn_dps * dt
+        if self.poison_timer > 0:
+            self.poison_timer -= dt
+            self.hp -= self.poison_dps * dt
         px, py = player_pos
         dx = px - self.x
         dy = py - self.y
         l = math.hypot(dx, dy) or 1
-        self.x += dx / l * self.speed * dt * FPS
-        self.y += dy / l * self.speed * dt * FPS
+        speed_mult = 0.55 if self.ice_timer > 0 else 1.0
+        self.x += dx / l * self.speed * speed_mult * dt * FPS
+        self.y += dy / l * self.speed * speed_mult * dt * FPS
 
     def draw(self, surf, cam):
         sx = int(self.x - cam[0])
@@ -156,8 +181,18 @@ class Enemy:
             col = COLOR_ENEMY_TANK
         elif self.kind == "fast":
             col = COLOR_ENEMY_FAST
+        elif self.kind == "shooter":
+            col = (180, 120, 255)
+        elif self.kind == "sprinter":
+            col = (255, 160, 160)
+        elif self.kind == "bruiser":
+            col = (200, 90, 60)
+        elif self.kind == "boss":
+            col = (255, 120, 40)
         else:
             col = COLOR_ENEMY
+        if self.flash_timer > 0:
+            col = COLOR_WHITE
         pygame.draw.circle(surf, col, (sx, sy), self.radius)
 
 
@@ -220,6 +255,9 @@ class Player:
         self.bullet_count = 1
         self.spread_angle_deg = 8.0
         self.piercing = False
+        self.back_shot = False
+        self.back_extra = False
+        self.bullet_status = {"ice": False, "burn": False, "poison": False}
 
         # gas boost
         self.gas_timer = 0.0
@@ -232,8 +270,15 @@ class Player:
         self.xp_to_level = XP_PER_LEVEL
         self.kills = 0
 
+        # ammo
+        self.mag_size = 12
+        self.ammo = self.mag_size
+        self.reload_time = 1.2
+        self.reload_timer = 0.0
+
         self.level_ups_since_reward = 0
         self.invuln = 0.0  # seconds of i-frames
+        self.hit_flash = 0.0
 
     @property
     def hp(self):
@@ -246,6 +291,12 @@ class Player:
     def update(self, dt, keys):
         if self.invuln > 0:
             self.invuln -= dt
+        if self.hit_flash > 0:
+            self.hit_flash -= dt
+        if self.reload_timer > 0:
+            self.reload_timer -= dt
+            if self.reload_timer <= 0:
+                self.ammo = self.mag_size
 
         # gas buff timer
         if self.gas_timer > 0:
@@ -276,10 +327,11 @@ class Player:
         self.time_since_shot += dt
 
     def can_shoot(self):
-        return self.time_since_shot >= self.fire_cd
+        return self.time_since_shot >= self.fire_cd and self.ammo > 0 and self.reload_timer <= 0
 
     def shoot(self, target_world_pos):
         self.time_since_shot = 0.0
+        self.ammo = max(0, self.ammo - 1)
         tx, ty = target_world_pos
         dx = tx - self.x
         dy = ty - self.y
@@ -294,13 +346,33 @@ class Player:
             angles = [start + i * step for i in range(self.bullet_count)]
 
         bullets = []
+        status = {
+            "ice": self.bullet_status["ice"],
+            "burn": self.bullet_status["burn"],
+            "poison": self.bullet_status["poison"],
+        }
+
         for a in angles:
             vx = math.cos(a)
             vy = math.sin(a)
-            b = Bullet(self.x, self.y, vx, vy, self.damage, self.bullet_speed)
+            b = Bullet(self.x, self.y, vx, vy, self.damage, self.bullet_speed, status=status.copy())
             b.piercing = self.piercing
             b.pierce_left = 1 if self.piercing else 0
             bullets.append(b)
+
+        if self.back_shot:
+            back_angle = base_angle + math.pi
+            extras = 1 + (1 if self.back_extra else 0)
+            for i in range(extras):
+                offset = math.radians(6 * (i - extras // 2)) if extras > 1 else 0
+                vx = math.cos(back_angle + offset)
+                vy = math.sin(back_angle + offset)
+                b = Bullet(self.x, self.y, vx, vy, self.damage, self.bullet_speed, status=status.copy())
+                b.piercing = self.piercing
+                b.pierce_left = 1 if self.piercing else 0
+                bullets.append(b)
+        if self.ammo <= 0:
+            self.reload_timer = self.reload_time
         return bullets
 
     def draw(self, surf):
@@ -311,16 +383,20 @@ class Player:
         ca = math.cos(ang)
         sa = math.sin(ang)
         r = self.radius
+        if self.invuln > 0 and int(self.invuln * 15) % 2 == 0:
+            return  # blink while invulnerable
+        color = COLOR_WHITE if self.hit_flash > 0 else COLOR_PLAYER
         p1 = (px + ca * r, py + sa * r)
         p2 = (px - sa * r * 0.7, py + ca * r * 0.7)
         p3 = (px + sa * r * 0.7, py - ca * r * 0.7)
-        pygame.draw.polygon(surf, COLOR_PLAYER, [p1, p2, p3])
+        pygame.draw.polygon(surf, color, [p1, p2, p3])
 
     def take_damage(self, hearts=1):
         if self.invuln > 0:
             return
         self.hearts = clamp(self.hearts - hearts, 0, self.max_hearts)
         self.invuln = 1.0  # 1s i-frames after hit
+        self.hit_flash = 0.2
 
     def heal(self, hearts=1):
         self.hearts = clamp(self.hearts + hearts, 0, self.max_hearts)
@@ -349,64 +425,104 @@ class Player:
 
 
 POWERUPS = [
-    "damage",
-    "speed",
-    "fire_rate",
-    "heart_container",
-    "heal",
-    "twin_shot",
-    "triple_spread",
+    "bullet_2",
+    "bullet_3",
+    "bullet_4",
+    "bullet_5",
+    "bullet_6",
+    "backshot",
+    "backshot_plus",
     "pierce",
+    "damage_up",
+    "move_10",
+    "move_15",
+    "move_20",
+    "hp_up",
+    "ice_rounds",
+    "burn_rounds",
+    "poison_rounds",
 ]
 
 
 def apply_powerup(player: Player, pid: str):
-    if pid == "damage":
-        player.damage += 5
-    elif pid == "speed":
-        player.base_speed += 0.5
-        player.speed = player.base_speed
-    elif pid == "fire_rate":
-        player.fire_rate *= 1.15
-        player.fire_cd = 1.0 / player.fire_rate
-    elif pid == "heart_container":
-        player.add_heart_container()
-    elif pid == "heal":
-        player.heal(2)
-    elif pid == "twin_shot":
+    if pid == "bullet_2":
         player.bullet_count = max(player.bullet_count, 2)
-        player.spread_angle_deg = max(player.spread_angle_deg, 10)
-    elif pid == "triple_spread":
+    elif pid == "bullet_3":
         player.bullet_count = max(player.bullet_count, 3)
-        player.spread_angle_deg = max(player.spread_angle_deg, 18)
+    elif pid == "bullet_4":
+        player.bullet_count = max(player.bullet_count, 4)
+    elif pid == "bullet_5":
+        player.bullet_count = max(player.bullet_count, 5)
+    elif pid == "bullet_6":
+        player.bullet_count = max(player.bullet_count, 6)
+    elif pid == "backshot":
+        player.back_shot = True
+    elif pid == "backshot_plus":
+        player.back_shot = True
+        player.back_extra = True
     elif pid == "pierce":
         player.piercing = True
+    elif pid == "damage_up":
+        player.damage += 6
+    elif pid == "move_10":
+        player.base_speed *= 1.10
+        player.speed = player.base_speed
+    elif pid == "move_15":
+        player.base_speed *= 1.15
+        player.speed = player.base_speed
+    elif pid == "move_20":
+        player.base_speed *= 1.20
+        player.speed = player.base_speed
+    elif pid == "hp_up":
+        player.add_heart_container()
+    elif pid == "ice_rounds":
+        player.bullet_status["ice"] = True
+    elif pid == "burn_rounds":
+        player.bullet_status["burn"] = True
+    elif pid == "poison_rounds":
+        player.bullet_status["poison"] = True
 
 
 def powerup_name(pid: str) -> str:
     names = {
-        "damage": "Overcharged Rounds",
-        "speed": "Thrusters",
-        "fire_rate": "Rapid Fire",
-        "heart_container": "Extra Heart",
-        "heal": "Heal",
-        "twin_shot": "Twin Shot",
-        "triple_spread": "Triple Spread",
-        "pierce": "Piercing Bullets",
+        "bullet_2": "Double Shot",
+        "bullet_3": "Triple Shot",
+        "bullet_4": "Quad Shot",
+        "bullet_5": "Penta Shot",
+        "bullet_6": "Hexa Shot",
+        "backshot": "Rear Gun",
+        "backshot_plus": "Rear Barrage",
+        "pierce": "Piercing Rounds",
+        "damage_up": "Overcharged Rounds",
+        "move_10": "Thrusters I",
+        "move_15": "Thrusters II",
+        "move_20": "Thrusters III",
+        "hp_up": "Extra Heart",
+        "ice_rounds": "Cryo Rounds",
+        "burn_rounds": "Incendiary",
+        "poison_rounds": "Toxic Rounds",
     }
     return names[pid]
 
 
 def powerup_desc(pid: str) -> str:
     desc = {
-        "damage": "+5 bullet damage",
-        "speed": "+0.5 move speed",
-        "fire_rate": "Shoot faster",
-        "heart_container": "+1 max heart, full heal",
-        "heal": "Restore 2 hearts",
-        "twin_shot": "Fire 2 bullets",
-        "triple_spread": "Fire 3 bullets in a spread",
+        "bullet_2": "+1 projectile",
+        "bullet_3": "+2 projectiles",
+        "bullet_4": "+3 projectiles",
+        "bullet_5": "+4 projectiles",
+        "bullet_6": "+5 projectiles",
+        "backshot": "Shoot one backward",
+        "backshot_plus": "Shoot two backward",
         "pierce": "Bullets pierce one enemy",
+        "damage_up": "+6 bullet damage",
+        "move_10": "+10% move speed",
+        "move_15": "+15% move speed",
+        "move_20": "+20% move speed",
+        "hp_up": "+1 max heart",
+        "ice_rounds": "Slow enemies on hit",
+        "burn_rounds": "Apply burn DoT",
+        "poison_rounds": "Apply poison DoT",
     }
     return desc[pid]
 
@@ -426,10 +542,12 @@ class Game:
             self.font_large = pygame.font.Font(font_path, 64)
             self.font_medium = pygame.font.Font(font_path, 30)
             self.font_small = pygame.font.Font(font_path, 20)
+            self.font_tiny = pygame.font.Font(font_path, 16)
         else:
             self.font_large = pygame.font.SysFont("PressStart2P", 64)
             self.font_medium = pygame.font.SysFont("PressStart2P", 30)
             self.font_small = pygame.font.SysFont("PressStart2P", 20)
+            self.font_tiny = pygame.font.SysFont("PressStart2P", 16)
 
         self.state = STATE_MENU
 
@@ -517,15 +635,19 @@ class Game:
 
         # starfield
         def rand_star_pos():
-            sx = clamp(random.gauss(0, WORLD_SIZE / 4), -WORLD_SIZE / 2, WORLD_SIZE / 2)
-            sy = clamp(random.gauss(0, WORLD_SIZE / 4), -WORLD_SIZE / 2, WORLD_SIZE / 2)
+            sx = clamp(random.gauss(0, WORLD_SIZE / 5), -WORLD_SIZE / 2, WORLD_SIZE / 2)
+            sy = clamp(random.gauss(0, WORLD_SIZE / 5), -WORLD_SIZE / 2, WORLD_SIZE / 2)
             return sx, sy
 
         self.stars = [
-            (
-                *rand_star_pos(),
-                random.randint(1, 4),
-            )
+            {
+                "x": rand_star_pos()[0],
+                "y": rand_star_pos()[1],
+                "r": random.randint(1, 4),
+                "blink": random.uniform(0, 1.0),
+                "blink_speed": random.uniform(0.8, 1.6),
+                "shape": random.choice(["dot", "diamond", "wide"]),
+            }
             for _ in range(STAR_COUNT)
         ]
         self.star_flashes = []
@@ -549,6 +671,12 @@ class Game:
         base_y = self.h // 2 - 10
         self.slider_bg_rect = pygame.Rect(self.w // 2 - slider_w // 2, base_y, slider_w, slider_h)
         self.slider_sfx_rect = pygame.Rect(self.w // 2 - slider_w // 2, base_y + 40, slider_w, slider_h)
+        # pause overlay sliders
+        p_slider_w = 260
+        p_slider_h = 10
+        p_base_y = self.h // 2 + 110
+        self.pause_music_rect = pygame.Rect(self.w // 2 - p_slider_w // 2, p_base_y, p_slider_w, p_slider_h)
+        self.pause_sfx_rect = pygame.Rect(self.w // 2 - p_slider_w // 2, p_base_y + 28, p_slider_w, p_slider_h)
         self.fullscreen = False
         self.window_size_index = 0
         self.show_size_dropdown = False
@@ -605,6 +733,7 @@ class Game:
         self.enemies = []
         self.orbs = []
         self.gas_pickups = []
+        self.enemy_bullets = []
         self.elapsed_time = 0.0
         self.spawn_timer = 0.0
         self.enemy_spawn_rate = ENEMY_SPAWN_RATE
@@ -618,6 +747,8 @@ class Game:
         self.game_over_audio_triggered = False
         self.defeat_music_timer = None
         self.boost_effect_timer = 0.0
+        self.damage_texts = []
+        self.bosses_spawned = 0
 
     def run(self):
         running = True
@@ -653,6 +784,11 @@ class Game:
         btn_y = self.h // 4 + 80
         self.btn_window_dropdown = Button((self.w // 2 - 220, btn_y, 200, 44), "WINDOWED ▼", self.font_small, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_WHITE)
         self.btn_fullscreen = Button((self.w // 2 + 20, btn_y, 200, 44), "FULLSCREEN", self.font_small, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_WHITE)
+        p_slider_w = 260
+        p_slider_h = 10
+        p_base_y = self.h // 2 + 110
+        self.pause_music_rect = pygame.Rect(self.w // 2 - p_slider_w // 2, p_base_y, p_slider_w, p_slider_h)
+        self.pause_sfx_rect = pygame.Rect(self.w // 2 - p_slider_w // 2, p_base_y + 28, p_slider_w, p_slider_h)
 
     def _apply_display_mode(self):
         global WIDTH, HEIGHT
@@ -752,6 +888,16 @@ class Game:
                 audio.play_sfx(audio.snd_unpause)
                 self.state = STATE_MENU
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                mx, my = e.pos
+                if self.pause_music_rect.collidepoint(mx, my):
+                    t = (mx - self.pause_music_rect.x) / self.pause_music_rect.width
+                    self.music_volume = clamp(t, 0.0, 1.0)
+                    audio.set_music_volume(self.music_volume)
+                elif self.pause_sfx_rect.collidepoint(mx, my):
+                    t = (mx - self.pause_sfx_rect.x) / self.pause_sfx_rect.width
+                    self.sfx_volume = clamp(t, 0.0, 1.0)
+                    audio.set_sfx_volume(self.sfx_volume)
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 # click anywhere else to resume
                 audio.play_sfx(audio.snd_unpause)
                 self.state = STATE_PLAYING
@@ -788,11 +934,17 @@ class Game:
                 self.star_flashes.remove(f)
 
         # spawn new flash occasionally
-        if random.random() < 0.08 and self.stars:
-            sx, sy, _ = random.choice(self.stars)
-            radius = random.randint(2, 3)
-            life = random.uniform(0.25, 0.55)
-            self.star_flashes.append({"x": sx, "y": sy, "r": radius, "life": life, "life_max": life})
+        if random.random() < 0.12 and self.stars:
+            star = random.choice(self.stars)
+            radius = random.randint(2, 4)
+            life = random.uniform(0.25, 0.65)
+            self.star_flashes.append({"x": star["x"], "y": star["y"], "r": radius, "life": life, "life_max": life})
+
+        # star blink progress
+        for s in self.stars:
+            s["blink"] += dt * s["blink_speed"]
+            if s["blink"] > 1:
+                s["blink"] -= 1
 
     def _update_music(self, dt):
         # menu + settings music
@@ -861,8 +1013,17 @@ class Game:
         if self.boost_effect_timer > 0:
             self.boost_effect_timer = max(0.0, self.boost_effect_timer - dt)
 
+        # damage texts
+        for txt in list(self.damage_texts):
+            txt["life"] -= dt
+            txt["y"] -= 20 * dt
+            if txt["life"] <= 0:
+                self.damage_texts.remove(txt)
+
         # spawn progression: unlock variants over time
         self.spawn_timer += dt
+        # scale spawn rate every 30s
+        self.enemy_spawn_rate = ENEMY_SPAWN_RATE + 0.25 * int(self.elapsed_time // 30)
         interval = 1.0 / self.enemy_spawn_rate
         while self.spawn_timer >= interval:
             self.spawn_timer -= interval
@@ -873,11 +1034,66 @@ class Game:
         for o in self.orbs:
             o.update(dt, (self.player.x, self.player.y))
 
+        # DoT deaths
+        for en in list(self.enemies):
+            if en.hp <= 0:
+                self.kills += 1
+                self.player.kills += 1
+                self.orbs.append(XPOrb(en.x, en.y, XP_PER_ORB))
+                if random.random() < 0.05:
+                    self.gas_pickups.append(GasPickup(en.x, en.y))
+                self.enemies.remove(en)
+
+        # enemy shooting
+        for en in self.enemies:
+            if getattr(en, "kind", "") in ("shooter", "boss", "elite_shooter"):
+                if not hasattr(en, "shoot_cd"):
+                    en.shoot_cd = random.uniform(1.0, 2.4)
+                en.shoot_cd -= dt
+                if en.shoot_cd <= 0:
+                    en.shoot_cd = random.uniform(1.0, 2.0) if en.kind != "boss" else random.uniform(0.6, 1.2)
+                    dx = self.player.x - en.x
+                    dy = self.player.y - en.y
+                    l = math.hypot(dx, dy) or 1
+                    speed = 9.0 if en.kind != "boss" else 12.0
+                    self.enemy_bullets.append({"x": en.x, "y": en.y, "vx": dx / l * speed, "vy": dy / l * speed, "r": 6 if en.kind == "boss" else 4, "dmg": 1})
+
+        # enemy bullets update/collisions
+        for eb in list(self.enemy_bullets):
+            eb["x"] += eb["vx"] * dt * FPS
+            eb["y"] += eb["vy"] * dt * FPS
+            if circle_collision(self.player.x, self.player.y, self.player.radius, eb["x"], eb["y"], eb["r"]):
+                if self.player.invuln <= 0:
+                    self.player.take_damage(1)
+                    self.player.hit_flash = 0.2
+                if eb in self.enemy_bullets:
+                    self.enemy_bullets.remove(eb)
+                continue
+            if abs(eb["x"] - self.player.x) > 2000 or abs(eb["y"] - self.player.y) > 2000:
+                self.enemy_bullets.remove(eb)
+
         # bullet-enemy
         for b in list(self.bullets):
             for en in list(self.enemies):
                 if circle_collision(b.x, b.y, b.radius, en.x, en.y, en.radius):
                     en.hp -= b.damage
+                    en.flash_timer = 0.15
+                    dx = en.x - b.x
+                    dy = en.y - b.y
+                    l = math.hypot(dx, dy) or 1
+                    push = 12
+                    en.x += dx / l * push
+                    en.y += dy / l * push
+                    self.damage_texts.append({"x": en.x + random.uniform(-6, 6), "y": en.y - 10, "val": b.damage, "life": 0.6})
+                    # apply status effects
+                    if b.status.get("ice"):
+                        en.ice_timer = max(en.ice_timer, 1.2)
+                    if b.status.get("burn"):
+                        en.burn_timer = max(en.burn_timer, 2.5)
+                        en.burn_dps = max(en.burn_dps, self.player.damage * 0.35)
+                    if b.status.get("poison"):
+                        en.poison_timer = max(en.poison_timer, 3.5)
+                        en.poison_dps = max(en.poison_dps, self.player.damage * 0.25)
                     if b.piercing and b.pierce_left > 0:
                         b.pierce_left -= 1
                     else:
@@ -909,6 +1125,7 @@ class Game:
                     self.player.y += dy / l * push
                     en.x -= dx / l * push
                     en.y -= dy / l * push
+                    self.player.hit_flash = 0.2
                     if self.player.hp <= 0:
                         audio.play_sfx(audio.snd_player_death)
                         self._spawn_death_fx(self.player.x, self.player.y)
@@ -936,14 +1153,14 @@ class Game:
 
     def _spawn_death_fx(self, x, y):
         self.death_fx.clear()
-        for _ in range(40):
+        for _ in range(120):
             ang = random.uniform(0, math.tau)
-            spd = random.uniform(80, 180)
+            spd = random.uniform(140, 320)
             self.death_fx.append({
                 "x": x, "y": y,
                 "vx": math.cos(ang) * spd,
                 "vy": math.sin(ang) * spd,
-                "life": random.uniform(0.4, 0.8),
+                "life": random.uniform(0.5, 1.2),
             })
 
     def spawn_enemy(self):
@@ -958,26 +1175,48 @@ class Game:
 
         # choose enemy type based on elapsed time
         t = self.elapsed_time
-        if t < 60:
-            kind = "normal"
-        elif t < 120:
-            kind = random.choices(
-                ["normal", "fast"], weights=[0.7, 0.3]
-            )[0]
+        hp_scale = 1.0 + (t / 90.0)
+        speed_scale = 1.0 + (t / 180.0)
+
+        # timed boss every minute
+        if int(t // 60) > self.bosses_spawned:
+            self.bosses_spawned += 1
+            kind = "boss"
         else:
-            kind = random.choices(
-                ["normal", "fast", "tank"], weights=[0.5, 0.3, 0.2]
-            )[0]
+            pool = ["normal", "fast", "tank"]
+            weights = [0.45, 0.25, 0.2]
+            if t > 45:
+                pool.append("shooter")
+                weights.append(0.15)
+            if t > 90:
+                pool.append("sprinter")
+                weights.append(0.15)
+            if t > 120:
+                pool.append("bruiser")
+                weights.append(0.2)
+            kind = random.choices(pool, weights=weights, k=1)[0]
 
         if kind == "tank":
-            hp = int(ENEMY_BASE_HP * 3)
-            speed = ENEMY_BASE_SPEED * 0.7
+            hp = int(ENEMY_BASE_HP * 3 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 0.7 * speed_scale
         elif kind == "fast":
-            hp = int(ENEMY_BASE_HP * 0.7)
-            speed = ENEMY_BASE_SPEED * 1.8
+            hp = int(ENEMY_BASE_HP * 0.7 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 1.8 * speed_scale
+        elif kind == "sprinter":
+            hp = int(ENEMY_BASE_HP * 0.8 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 2.4 * speed_scale
+        elif kind == "bruiser":
+            hp = int(ENEMY_BASE_HP * 4.0 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 0.9 * speed_scale
+        elif kind == "shooter":
+            hp = int(ENEMY_BASE_HP * 1.4 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 1.0 * speed_scale
+        elif kind == "boss":
+            hp = int(ENEMY_BASE_HP * 10 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 1.4 * speed_scale
         else:
-            hp = ENEMY_BASE_HP
-            speed = ENEMY_BASE_SPEED
+            hp = int(ENEMY_BASE_HP * 1.0 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 1.0 * speed_scale
 
         self.enemies.append(Enemy(x, y, hp, speed, kind))
 
@@ -992,12 +1231,26 @@ class Game:
     def draw_background(self, cam):
         # Properly draw space starfield behind everything
         ox, oy = cam
-        for sx, sy, r in self.stars:
-            x = int(sx - ox)
-            y = int(sy - oy)
+        for s in self.stars:
+            x = int(s["x"] - ox)
+            y = int(s["y"] - oy)
             if -5 <= x <= self.w + 5 and -5 <= y <= self.h + 5:
-                color = (200, 200, 255) if r == 1 else (120, 120, 180)
-                pygame.draw.rect(self.screen, color, (x, y, r, r))
+                phase = s["blink"]
+                intensity = 0.5 + 0.5 * math.sin(phase * math.tau)
+                base_col = (200, 200, 255) if s["r"] == 1 else (140, 140, 200)
+                col = tuple(min(255, int(c * (0.7 + 0.6 * intensity))) for c in base_col)
+                if s["shape"] == "diamond":
+                    pts = [
+                        (x, y - s["r"]),
+                        (x + s["r"] + 1, y),
+                        (x, y + s["r"] + 1),
+                        (x - s["r"] - 1, y),
+                    ]
+                    pygame.draw.polygon(self.screen, col, pts)
+                elif s["shape"] == "wide":
+                    pygame.draw.rect(self.screen, col, (x, y, s["r"] + 3, s["r"]))
+                else:
+                    pygame.draw.rect(self.screen, col, (x, y, s["r"], s["r"]))
         # shimmering pops
         for f in list(self.star_flashes):
             fx = int(f["x"] - ox)
@@ -1047,8 +1300,13 @@ class Game:
             e.draw(self.screen, cam)
         for b in self.bullets:
             b.draw(self.screen, cam)
+        for eb in self.enemy_bullets:
+            sx = int(eb["x"] - cam[0])
+            sy = int(eb["y"] - cam[1])
+            pygame.draw.circle(self.screen, COLOR_RED, (sx, sy), eb["r"])
         self.player.draw(self.screen)
         self._draw_death_fx(cam)
+        self._draw_damage_texts(cam)
 
     def draw_boost_overlay(self):
         if self.boost_effect_timer <= 0:
@@ -1067,20 +1325,32 @@ class Game:
         for fx in self.death_fx:
             sx = int(fx["x"] - cam[0])
             sy = int(fx["y"] - cam[1])
-            r = max(1, int(4 * fx["life"]))
+            r = max(2, int(7 * fx["life"]))
             pygame.draw.circle(self.screen, COLOR_RED, (sx, sy), r)
 
+    def _draw_damage_texts(self, cam):
+        for txt in self.damage_texts:
+            sx = int(txt["x"] - cam[0])
+            sy = int(txt["y"] - cam[1])
+            alpha = int(255 * (txt["life"] / 0.6))
+            surf = self.font_small.render(str(txt["val"]), True, COLOR_YELLOW)
+            surf.set_alpha(alpha)
+            self.screen.blit(surf, (sx, sy))
+
     def draw_hud(self):
-        # hearts at top-left
-        x = 16
-        y = 14
+        base_y = self.btn_pause.rect.y + 6
+        # LVL label on left of HP
+        lvl_txt = self.font_small.render(f"LVL {self.player.level}", True, COLOR_WHITE)
+        lvl_x = 16
+        self.screen.blit(lvl_txt, (lvl_x, base_y))
+        # hearts aligned to pause row
+        x = lvl_x + lvl_txt.get_width() + 16
         spacing = 24
         for i in range(self.player.max_hearts):
             col = COLOR_RED if i < self.player.hearts else COLOR_DARK_GRAY
             cx = x + i * spacing
-            pygame.draw.polygon(self.screen, col, [(cx + 6, y + 6), (cx, y + 12), (cx + 6, y + 18), (cx + 12, y + 12)])
-        lvl_txt = self.font_small.render(f"LVL {self.player.level}", True, COLOR_WHITE)
-        self.screen.blit(lvl_txt, (x + self.player.max_hearts * spacing + 12, y + 2))
+            cy = base_y + 2
+            pygame.draw.polygon(self.screen, col, [(cx + 6, cy + 6), (cx, cy + 12), (cx + 6, cy + 18), (cx + 12, cy + 12)])
         # xp bar
         bw2, bh2 = self.w - 200, 10
         x2, y2 = 100, self.h - 30
@@ -1091,15 +1361,23 @@ class Game:
         t = int(self.elapsed_time)
         m, s = t // 60, t % 60
         timer_text = self.font_small.render(f"{m:02d}:{s:02d}", True, COLOR_WHITE)
-        time_y = y + 2
+        time_y = base_y
         self.screen.blit(timer_text, (self.w // 2 - timer_text.get_width() // 2, time_y))
-        # kills aligned with pause button
+        # kills aligned with pause button row
         kills_txt = self.font_small.render(f"KILLS {self.kills}", True, COLOR_WHITE)
-        kills_y = y + 2
+        kills_y = base_y
         kills_x = self.btn_pause.rect.x - kills_txt.get_width() - 14
         self.screen.blit(kills_txt, (kills_x, kills_y))
         if self.state == STATE_PLAYING:
             self.btn_pause.draw(self.screen)
+
+        # ammo row under HP
+        ammo_y = base_y + 26
+        if self.player.reload_timer > 0:
+            ammo_txt = self.font_small.render("RELOADING...", True, COLOR_YELLOW)
+        else:
+            ammo_txt = self.font_small.render(f"AMMO {self.player.ammo}/{self.player.mag_size}", True, COLOR_WHITE)
+        self.screen.blit(ammo_txt, (lvl_x, ammo_y))
 
     def draw_levelup(self):
         overlay = pygame.Surface((self.w, self.h))
@@ -1108,9 +1386,9 @@ class Game:
         self.screen.blit(overlay, (0, 0))
         title = self.font_large.render("LEVEL UP", True, COLOR_YELLOW)
         self.screen.blit(title, (self.w // 2 - title.get_width() // 2, self.h // 4))
-        w = 260
-        h = 120
-        gap = 20
+        w = 320
+        h = 150
+        gap = 24
         total_w = 3 * w + 2 * gap
         start_x = WIDTH // 2 - total_w // 2
         y = HEIGHT // 2 - h // 2
@@ -1123,14 +1401,14 @@ class Game:
             name = powerup_name(pid)
             desc = powerup_desc(pid)
             t1 = self.font_small.render(name, True, COLOR_WHITE)
-            t2 = self.font_small.render(desc, True, COLOR_WHITE)
+            t2 = self.font_tiny.render(desc, True, COLOR_WHITE)
             self.screen.blit(
                 t1,
-                (rect.centerx - t1.get_width() // 2, rect.y + 16),
+                (rect.centerx - t1.get_width() // 2, rect.y + rect.height // 2 - t1.get_height()),
             )
             self.screen.blit(
                 t2,
-                (rect.centerx - t2.get_width() // 2, rect.y + 52),
+                (rect.centerx - t2.get_width() // 2, rect.y + rect.height // 2 + 4),
             )
 
     def draw_game_over(self):
@@ -1174,6 +1452,18 @@ class Game:
         self.btn_pause_resume.draw(self.screen)
         self.btn_pause_reset.draw(self.screen)
         self.btn_pause_quit.draw(self.screen)
+        # volume sliders in pause
+        label_music = self.font_small.render("MUSIC", True, COLOR_WHITE)
+        self.screen.blit(label_music, (self.pause_music_rect.x, self.pause_music_rect.y - 16))
+        pygame.draw.rect(self.screen, COLOR_DARK_GRAY, self.pause_music_rect)
+        filled_m = int(self.pause_music_rect.width * self.music_volume)
+        pygame.draw.rect(self.screen, COLOR_GREEN, (self.pause_music_rect.x, self.pause_music_rect.y, filled_m, self.pause_music_rect.height))
+
+        label_sfx = self.font_small.render("SFX", True, COLOR_WHITE)
+        self.screen.blit(label_sfx, (self.pause_sfx_rect.x, self.pause_sfx_rect.y - 16))
+        pygame.draw.rect(self.screen, COLOR_DARK_GRAY, self.pause_sfx_rect)
+        filled_s = int(self.pause_sfx_rect.width * self.sfx_volume)
+        pygame.draw.rect(self.screen, COLOR_GREEN, (self.pause_sfx_rect.x, self.pause_sfx_rect.y, filled_s, self.pause_sfx_rect.height))
 
     def _dropdown_rect(self):
         option_h = 34
