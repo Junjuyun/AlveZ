@@ -51,7 +51,7 @@ XP_LEVEL_GROWTH = 1.45   # each level needs ~45% more XP
 SCREEN_SHAKE_DECAY = 3.0
 
 # increase star density
-STAR_COUNT = 2600
+STAR_COUNT = 8500
 
 # powerup gating
 POWERUP_FIRST = 1      # first level-up gives powerup
@@ -72,17 +72,19 @@ def circle_collision(x1, y1, r1, x2, y2, r2):
 
 
 class Button:
-    def __init__(self, rect, text, font, base_color, hover_color):
+    def __init__(self, rect, text, font, base_color, hover_color, active_color=None):
         self.rect = pygame.Rect(rect)
         self.text = text
         self.font = font
         self.base_color = base_color
         self.hover_color = hover_color
+        self.active_color = active_color or hover_color
 
     def draw(self, surf):
         mouse_pos = pygame.mouse.get_pos()
         is_hover = self.rect.collidepoint(mouse_pos)
-        color = self.hover_color if is_hover else self.base_color
+        is_pressed = is_hover and pygame.mouse.get_pressed()[0]
+        color = self.active_color if is_pressed else (self.hover_color if is_hover else self.base_color)
         pygame.draw.rect(surf, color, self.rect, border_radius=8)
         label = self.font.render(self.text, True, COLOR_WHITE)
         surf.blit(
@@ -418,15 +420,16 @@ class Game:
         pygame.display.set_caption("Starlight Eclipse")
         self.clock = pygame.time.Clock()
 
-        # larger pixel font
-        try:
-            self.font_large = pygame.font.SysFont("PressStart2P", 48)
-            self.font_medium = pygame.font.SysFont("PressStart2P", 24)
-            self.font_small = pygame.font.SysFont("PressStart2P", 16)
-        except Exception:
-            self.font_large = pygame.font.SysFont("consolas", 48)
-            self.font_medium = pygame.font.SysFont("consolas", 24)
-            self.font_small = pygame.font.SysFont("consolas", 16)
+        # pixel font (bundled)
+        font_path = os.path.join(os.path.dirname(__file__), "Assets", "UI", "Press_Start_2P", "PressStart2P-Regular.ttf")
+        if os.path.isfile(font_path):
+            self.font_large = pygame.font.Font(font_path, 64)
+            self.font_medium = pygame.font.Font(font_path, 30)
+            self.font_small = pygame.font.Font(font_path, 20)
+        else:
+            self.font_large = pygame.font.SysFont("PressStart2P", 64)
+            self.font_medium = pygame.font.SysFont("PressStart2P", 30)
+            self.font_small = pygame.font.SysFont("PressStart2P", 20)
 
         self.state = STATE_MENU
 
@@ -475,6 +478,33 @@ class Game:
             self.font_small,
             COLOR_DARK_GRAY,
             COLOR_GRAY,
+            COLOR_WHITE,
+        )
+
+        # Pause overlay actions
+        self.btn_pause_reset = Button(
+            (self.w // 2 - 110, self.h // 2 + 24, 220, 44),
+            "RESET",
+            self.font_medium,
+            COLOR_DARK_GRAY,
+            COLOR_GRAY,
+            COLOR_WHITE,
+        )
+        self.btn_pause_quit = Button(
+            (self.w // 2 - 110, self.h // 2 + 74, 220, 44),
+            "QUIT",
+            self.font_medium,
+            COLOR_DARK_GRAY,
+            COLOR_GRAY,
+            COLOR_WHITE,
+        )
+        self.btn_pause_resume = Button(
+            (self.w // 2 - 110, self.h // 2 - 26, 220, 44),
+            "RESUME",
+            self.font_medium,
+            COLOR_DARK_GRAY,
+            COLOR_GRAY,
+            COLOR_WHITE,
         )
 
         self.btn_settings_back = Button(
@@ -486,14 +516,19 @@ class Game:
         )
 
         # starfield
+        def rand_star_pos():
+            sx = clamp(random.gauss(0, WORLD_SIZE / 4), -WORLD_SIZE / 2, WORLD_SIZE / 2)
+            sy = clamp(random.gauss(0, WORLD_SIZE / 4), -WORLD_SIZE / 2, WORLD_SIZE / 2)
+            return sx, sy
+
         self.stars = [
             (
-                random.uniform(-WORLD_SIZE / 2, WORLD_SIZE / 2),
-                random.uniform(-WORLD_SIZE / 2, WORLD_SIZE / 2),
+                *rand_star_pos(),
                 random.randint(1, 4),
             )
             for _ in range(STAR_COUNT)
         ]
+        self.star_flashes = []
 
         self.levelup_options = []
 
@@ -516,6 +551,25 @@ class Game:
         self.slider_sfx_rect = pygame.Rect(self.w // 2 - slider_w // 2, base_y + 40, slider_w, slider_h)
         self.fullscreen = False
         self.window_size_index = 0
+        self.show_size_dropdown = False
+
+        btn_y = self.h // 4 + 80
+        self.btn_window_dropdown = Button(
+            (self.w // 2 - 220, btn_y, 200, 44),
+            "WINDOWED ▼",
+            self.font_small,
+            COLOR_DARK_GRAY,
+            COLOR_GRAY,
+            COLOR_WHITE,
+        )
+        self.btn_fullscreen = Button(
+            (self.w // 2 + 20, btn_y, 200, 44),
+            "FULLSCREEN",
+            self.font_small,
+            COLOR_DARK_GRAY,
+            COLOR_GRAY,
+            COLOR_WHITE,
+        )
 
         self.reset_game()
         self._load_audio_assets()
@@ -563,6 +617,7 @@ class Game:
         self.death_timer = 0.0
         self.game_over_audio_triggered = False
         self.defeat_music_timer = None
+        self.boost_effect_timer = 0.0
 
     def run(self):
         running = True
@@ -590,8 +645,14 @@ class Game:
         self.btn_quit = Button((self.w // 2 - 150, self.h // 2 + 60, 300, 44), "QUIT", self.font_medium, COLOR_DARK_GRAY, COLOR_GRAY)
         self.btn_restart = Button((self.w // 2 - 150, self.h // 2 + 50, 300, 44), "RESTART", self.font_medium, COLOR_DARK_GRAY, COLOR_GRAY)
         self.btn_main_menu = Button((self.w // 2 - 150, self.h // 2 + 100, 300, 44), "MAIN MENU", self.font_medium, COLOR_DARK_GRAY, COLOR_GRAY)
-        self.btn_pause = Button((self.w - 70, 16, 50, 32), "||", self.font_small, COLOR_DARK_GRAY, COLOR_GRAY)
+        self.btn_pause = Button((self.w - 70, 16, 50, 32), "||", self.font_small, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_WHITE)
+        self.btn_pause_reset = Button((self.w // 2 - 110, self.h // 2 + 24, 220, 44), "RESET", self.font_medium, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_WHITE)
+        self.btn_pause_quit = Button((self.w // 2 - 110, self.h // 2 + 74, 220, 44), "QUIT", self.font_medium, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_WHITE)
+        self.btn_pause_resume = Button((self.w // 2 - 110, self.h // 2 - 26, 220, 44), "RESUME", self.font_medium, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_WHITE)
         self.btn_settings_back = Button((self.w // 2 - 100, self.h // 2 + 120, 200, 44), "BACK", self.font_medium, COLOR_DARK_GRAY, COLOR_GRAY)
+        btn_y = self.h // 4 + 80
+        self.btn_window_dropdown = Button((self.w // 2 - 220, btn_y, 200, 44), "WINDOWED ▼", self.font_small, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_WHITE)
+        self.btn_fullscreen = Button((self.w // 2 + 20, btn_y, 200, 44), "FULLSCREEN", self.font_small, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_WHITE)
 
     def _apply_display_mode(self):
         global WIDTH, HEIGHT
@@ -605,6 +666,9 @@ class Game:
         base_y = self.h // 2 - 10
         self.slider_bg_rect.update(self.w // 2 - slider_w // 2, base_y, slider_w, slider_h)
         self.slider_sfx_rect.update(self.w // 2 - slider_w // 2, base_y + 40, slider_w, slider_h)
+        btn_y = self.h // 4 + 80
+        self.btn_window_dropdown.rect.update(self.w // 2 - 220, btn_y, 200, 44)
+        self.btn_fullscreen.rect.update(self.w // 2 + 20, btn_y, 200, 44)
 
     def handle_event(self, e):
         if self.state == STATE_MENU:
@@ -639,6 +703,7 @@ class Game:
         elif self.state == STATE_SETTINGS:
             if self.btn_settings_back.is_clicked(e):
                 self.state = STATE_MENU
+                self.show_size_dropdown = False
             if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 mx, my = e.pos
                 # BG volume slider
@@ -651,21 +716,43 @@ class Game:
                     t = (mx - self.slider_sfx_rect.x) / self.slider_sfx_rect.width
                     self.sfx_volume = clamp(t, 0.0, 1.0)
                     audio.set_sfx_volume(self.sfx_volume)
-                # fullscreen toggle
-                if mx < self.w // 2 - 110 and my > self.h // 2 + 70:
+                if self.btn_fullscreen.is_clicked(e):
                     self.fullscreen = not self.fullscreen
+                    self.show_size_dropdown = False
                     self._apply_display_mode()
-                # window size dropdown (simple cycle)
-                if mx > self.w // 2 + 30 and my > self.h // 2 + 70:
-                    self.window_size_index = (self.window_size_index + 1) % len(WINDOW_SIZES)
-                    self.w, self.h = WINDOW_SIZES[self.window_size_index]
-                    self._apply_display_mode()
+                elif self.btn_window_dropdown.is_clicked(e):
+                    self.show_size_dropdown = not self.show_size_dropdown
+                elif self.show_size_dropdown:
+                    # check dropdown options
+                    drop_rect = self._dropdown_rect()
+                    if drop_rect.collidepoint(mx, my):
+                        option_h = 34
+                        idx = (my - drop_rect.y) // option_h
+                        if 0 <= idx < len(WINDOW_SIZES):
+                            self.window_size_index = idx
+                            self.w, self.h = WINDOW_SIZES[self.window_size_index]
+                            self.fullscreen = False
+                            self.show_size_dropdown = False
+                            self._apply_display_mode()
+                    else:
+                        self.show_size_dropdown = False
         elif self.state == STATE_PLAYING:
             if self.btn_pause.is_clicked(e):
                 audio.play_sfx(audio.snd_pause)
                 self.state = STATE_PAUSED
         elif self.state == STATE_PAUSED:
-            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            if self.btn_pause_resume.is_clicked(e):
+                audio.play_sfx(audio.snd_unpause)
+                self.state = STATE_PLAYING
+            elif self.btn_pause_reset.is_clicked(e):
+                self.reset_game()
+                audio.play_sfx(audio.snd_unpause)
+                self.state = STATE_PLAYING
+            elif self.btn_pause_quit.is_clicked(e):
+                audio.play_sfx(audio.snd_unpause)
+                self.state = STATE_MENU
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                # click anywhere else to resume
                 audio.play_sfx(audio.snd_unpause)
                 self.state = STATE_PLAYING
         elif self.state == STATE_DEAD_ANIM:
@@ -673,6 +760,8 @@ class Game:
                 self.state = STATE_GAME_OVER
 
     def update(self, dt):
+        self._update_starfield(dt)
+
         if self.state == STATE_PLAYING:
             self.update_playing(dt)
         elif self.state == STATE_DEAD_ANIM:
@@ -690,6 +779,20 @@ class Game:
             fx["life"] -= dt
             if fx["life"] <= 0:
                 self.death_fx.remove(fx)
+
+    def _update_starfield(self, dt):
+        # decay active flashes
+        for f in list(self.star_flashes):
+            f["life"] -= dt
+            if f["life"] <= 0:
+                self.star_flashes.remove(f)
+
+        # spawn new flash occasionally
+        if random.random() < 0.08 and self.stars:
+            sx, sy, _ = random.choice(self.stars)
+            radius = random.randint(2, 3)
+            life = random.uniform(0.25, 0.55)
+            self.star_flashes.append({"x": sx, "y": sy, "r": radius, "life": life, "life_max": life})
 
     def _update_music(self, dt):
         # menu + settings music
@@ -754,6 +857,9 @@ class Game:
         for b in self.bullets:
             b.update(dt)
         self.bullets = [b for b in self.bullets if not b.offscreen(cam)]
+
+        if self.boost_effect_timer > 0:
+            self.boost_effect_timer = max(0.0, self.boost_effect_timer - dt)
 
         # spawn progression: unlock variants over time
         self.spawn_timer += dt
@@ -821,6 +927,13 @@ class Game:
                         self.player.level_ups_since_reward = 0
                         self.roll_levelup()
 
+        # gas pickup collision
+        for g in list(self.gas_pickups):
+            if circle_collision(self.player.x, self.player.y, self.player.radius, g.x, g.y, g.radius):
+                self.player.apply_gas(g.duration)
+                self.boost_effect_timer = max(self.boost_effect_timer, g.duration)
+                self.gas_pickups.remove(g)
+
     def _spawn_death_fx(self, x, y):
         self.death_fx.clear()
         for _ in range(40):
@@ -885,6 +998,15 @@ class Game:
             if -5 <= x <= self.w + 5 and -5 <= y <= self.h + 5:
                 color = (200, 200, 255) if r == 1 else (120, 120, 180)
                 pygame.draw.rect(self.screen, color, (x, y, r, r))
+        # shimmering pops
+        for f in list(self.star_flashes):
+            fx = int(f["x"] - ox)
+            fy = int(f["y"] - oy)
+            if -5 <= fx <= self.w + 5 and -5 <= fy <= self.h + 5:
+                alpha = int(255 * (f["life"] / f["life_max"]))
+                flash_surf = pygame.Surface((f["r"] * 2, f["r"] * 2), pygame.SRCALPHA)
+                pygame.draw.circle(flash_surf, (255, 255, 255, alpha), (f["r"], f["r"]), f["r"])
+                self.screen.blit(flash_surf, (fx - f["r"], fy - f["r"]))
 
     def draw(self):
         self.screen.fill(COLOR_BG)
@@ -892,12 +1014,13 @@ class Game:
             self.draw_menu()
         elif self.state in (STATE_PLAYING, STATE_LEVEL_UP, STATE_GAME_OVER, STATE_PAUSED, STATE_DEAD_ANIM):
             self.draw_game_world()
+            self.draw_boost_overlay()
             self.draw_hud()
             if self.state == STATE_LEVEL_UP:
                 self.draw_levelup()
             if self.state == STATE_GAME_OVER:
                 self.draw_game_over()
-            if self.state in (STATE_PAUSED, STATE_DEAD_ANIM):
+            if self.state == STATE_PAUSED:
                 self.draw_pause_overlay()
         elif self.state == STATE_SETTINGS:
             self.draw_settings()
@@ -927,6 +1050,19 @@ class Game:
         self.player.draw(self.screen)
         self._draw_death_fx(cam)
 
+    def draw_boost_overlay(self):
+        if self.boost_effect_timer <= 0:
+            return
+        strength = min(1.0, self.boost_effect_timer / 3.0)
+        thickness = 90
+        overlay = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        for i in range(thickness):
+            alpha = int(140 * (1 - i / thickness) * strength)
+            color = (80, 240, 220, alpha)
+            pygame.draw.rect(overlay, color, (i, 0, 1, self.h))
+            pygame.draw.rect(overlay, color, (self.w - i - 1, 0, 1, self.h))
+        self.screen.blit(overlay, (0, 0))
+
     def _draw_death_fx(self, cam):
         for fx in self.death_fx:
             sx = int(fx["x"] - cam[0])
@@ -944,7 +1080,7 @@ class Game:
             cx = x + i * spacing
             pygame.draw.polygon(self.screen, col, [(cx + 6, y + 6), (cx, y + 12), (cx + 6, y + 18), (cx + 12, y + 12)])
         lvl_txt = self.font_small.render(f"LVL {self.player.level}", True, COLOR_WHITE)
-        self.screen.blit(lvl_txt, (16, y + 30))
+        self.screen.blit(lvl_txt, (x + self.player.max_hearts * spacing + 12, y + 2))
         # xp bar
         bw2, bh2 = self.w - 200, 10
         x2, y2 = 100, self.h - 30
@@ -955,10 +1091,13 @@ class Game:
         t = int(self.elapsed_time)
         m, s = t // 60, t % 60
         timer_text = self.font_small.render(f"{m:02d}:{s:02d}", True, COLOR_WHITE)
-        self.screen.blit(timer_text, (self.w // 2 - timer_text.get_width() // 2, 8))
+        time_y = y + 2
+        self.screen.blit(timer_text, (self.w // 2 - timer_text.get_width() // 2, time_y))
         # kills aligned with pause button
         kills_txt = self.font_small.render(f"KILLS {self.kills}", True, COLOR_WHITE)
-        self.screen.blit(kills_txt, (self.btn_pause.rect.x - kills_txt.get_width() - 10, self.btn_pause.rect.y + 6))
+        kills_y = y + 2
+        kills_x = self.btn_pause.rect.x - kills_txt.get_width() - 14
+        self.screen.blit(kills_txt, (kills_x, kills_y))
         if self.state == STATE_PLAYING:
             self.btn_pause.draw(self.screen)
 
@@ -1029,7 +1168,17 @@ class Game:
         overlay.fill((0, 0, 0))
         self.screen.blit(overlay, (0, 0))
         t = self.font_large.render("PAUSED", True, COLOR_WHITE)
-        self.screen.blit(t, (self.w // 2 - t.get_width() // 2, self.h // 2 - t.get_height() // 2))
+        title_y = self.h // 2 - t.get_height() - 40
+        self.screen.blit(t, (self.w // 2 - t.get_width() // 2, title_y))
+        # buttons under the label
+        self.btn_pause_resume.draw(self.screen)
+        self.btn_pause_reset.draw(self.screen)
+        self.btn_pause_quit.draw(self.screen)
+
+    def _dropdown_rect(self):
+        option_h = 34
+        total_h = option_h * len(WINDOW_SIZES)
+        return pygame.Rect(self.btn_window_dropdown.rect.x, self.btn_window_dropdown.rect.bottom + 6, self.btn_window_dropdown.rect.width, total_h)
 
     def draw_settings(self):
         cam = (0, 0)
@@ -1068,10 +1217,23 @@ class Game:
             (self.slider_sfx_rect.x, self.slider_sfx_rect.y, filled_w2, self.slider_sfx_rect.height),
         )
 
-        # fullscreen/window toggle indicators
-        fs_label = self.font_small.render(f"MODE: {'FULL' if self.fullscreen else 'WINDOWED'}", True, COLOR_WHITE)
-        self.screen.blit(fs_label, (self.w // 2 - fs_label.get_width() // 2, self.h // 2 + 60))
-        size_label = self.font_small.render(f"SIZE: {self.w}x{self.h}", True, COLOR_WHITE)
-        self.screen.blit(size_label, (self.w // 2 - size_label.get_width() // 2, self.h // 2 + 80))
+        # windowed dropdown + fullscreen button under title
+        self.btn_window_dropdown.text = f"WINDOWED {'▲' if self.show_size_dropdown else '▼'}"
+        self.btn_fullscreen.text = "FULLSCREEN"
+        # simple active tint when fullscreen
+        self.btn_fullscreen.base_color = COLOR_GRAY if self.fullscreen else COLOR_DARK_GRAY
+        self.btn_fullscreen.hover_color = COLOR_WHITE if self.fullscreen else COLOR_GRAY
+        self.btn_window_dropdown.draw(self.screen)
+        self.btn_fullscreen.draw(self.screen)
+        if self.show_size_dropdown:
+            drop_rect = self._dropdown_rect()
+            option_h = 34
+            for i, (w, h) in enumerate(WINDOW_SIZES):
+                r = pygame.Rect(drop_rect.x, drop_rect.y + i * option_h, drop_rect.width, option_h)
+                is_selected = i == self.window_size_index and not self.fullscreen
+                col = COLOR_GRAY if is_selected else COLOR_DARK_GRAY
+                pygame.draw.rect(self.screen, col, r, border_radius=6)
+                txt = self.font_small.render(f"{w}x{h}", True, COLOR_WHITE)
+                self.screen.blit(txt, (r.x + 10, r.y + r.height // 2 - txt.get_height() // 2))
 
         self.btn_settings_back.draw(self.screen)
