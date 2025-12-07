@@ -17,7 +17,8 @@ class Button:
         mouse_pos = pygame.mouse.get_pos()
         is_hover = self.rect.collidepoint(mouse_pos)
         color = self.hover_color if is_hover else self.base_color
-        pygame.draw.rect(surf, color, self.rect, border_radius=8)
+        # pixel/blocky (no border_radius)
+        pygame.draw.rect(surf, color, self.rect, border_radius=0)
         label = self.font.render(self.text, True, COLOR_WHITE)
         surf.blit(
             label,

@@ -1,9 +1,13 @@
 import math
 
 # Window / display
-WIDTH, HEIGHT = 1920, 1080
+WIDTH, HEIGHT = 1280, 720  # default windowed
 FPS = 60
-FULLSCREEN_FLAGS = 0  # will be set in game.py using pygame.FULLSCREEN
+
+# Display modes
+DISPLAY_MODE_WINDOWED = "WINDOWED"
+DISPLAY_MODE_FULLSCREEN = "FULLSCREEN"
+DISPLAY_MODE_BORDERLESS = "BORDERLESS"
 
 # Colors
 COLOR_BG = (5, 5, 15)
@@ -73,3 +77,8 @@ def circle_collision(x1, y1, r1, x2, y2, r2):
 
 def vec_from_angle(angle):
     return math.cos(angle), math.sin(angle)
+
+# Audio defaults
+MASTER_VOLUME_DEFAULT = 0.8
+MUSIC_VOLUME_DEFAULT = 0.5
+SFX_VOLUME_DEFAULT = 0.8
