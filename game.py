@@ -4,527 +4,10 @@ import random
 import sys
 import pygame
 from audio import audio
-
-# === BASIC SETTINGS ===
-WIDTH, HEIGHT = 1280, 720
-FPS = 60
-
-COLOR_BG = (5, 5, 20)
-COLOR_WHITE = (240, 240, 240)
-COLOR_GRAY = (120, 120, 150)
-COLOR_DARK_GRAY = (40, 40, 70)
-COLOR_PLAYER = (120, 190, 255)
-COLOR_ENEMY = (235, 70, 70)
-COLOR_ENEMY_TANK = (200, 80, 40)
-COLOR_ENEMY_FAST = (240, 120, 120)
-COLOR_XP = (90, 240, 140)
-COLOR_GAS = (180, 255, 180)
-COLOR_BULLET = (255, 240, 120)
-COLOR_RED = (255, 80, 80)
-COLOR_GREEN = (90, 230, 90)
-COLOR_YELLOW = (255, 215, 120)
-
-STATE_MENU = "MENU"
-STATE_PLAYING = "PLAYING"
-STATE_LEVEL_UP = "LEVEL_UP"
-STATE_GAME_OVER = "GAME_OVER"
-STATE_SETTINGS = "SETTINGS"
-STATE_PAUSED = "PAUSED"
-STATE_DEAD_ANIM = "DEAD_ANIM"
-
-WORLD_SIZE = 20000
-PLAYER_RADIUS = 18
-ENEMY_RADIUS = 16
-BULLET_RADIUS = 5
-XP_RADIUS = 8
-GAS_RADIUS = 10
-
-ENEMY_BASE_HP = 30
-ENEMY_BASE_SPEED = 2.0
-ENEMY_SPAWN_RATE = 1.0
-
-# Tweak XP to be slower early and slower later
-XP_PER_ORB = 5           # less XP per orb
-XP_PER_LEVEL = 40        # more XP to level 2
-XP_LEVEL_GROWTH = 1.45   # each level needs ~45% more XP
-
-SCREEN_SHAKE_DECAY = 3.0
-
-# increase star density
-STAR_COUNT = 12000
-
-# powerup gating
-POWERUP_FIRST = 1      # first level-up gives powerup
-POWERUP_INTERVAL = 3   # thereafter every 3 levels
-
-# resolutions for dropdown
-WINDOW_SIZES = [(1280, 720), (1600, 900), (1920, 1080)]
-
-
-def clamp(v, a, b):
-    return max(a, min(b, v))
-
-
-def circle_collision(x1, y1, r1, x2, y2, r2):
-    dx = x1 - x2
-    dy = y1 - y2
-    return dx * dx + dy * dy <= (r1 + r2) ** 2
-
-
-class Button:
-    def __init__(self, rect, text, font, base_color, hover_color, active_color=None):
-        self.rect = pygame.Rect(rect)
-        self.text = text
-        self.font = font
-        self.base_color = base_color
-        self.hover_color = hover_color
-        self.active_color = active_color or hover_color
-
-    def draw(self, surf):
-        mouse_pos = pygame.mouse.get_pos()
-        is_hover = self.rect.collidepoint(mouse_pos)
-        is_pressed = is_hover and pygame.mouse.get_pressed()[0]
-        color = self.active_color if is_pressed else (self.hover_color if is_hover else self.base_color)
-        pygame.draw.rect(surf, color, self.rect, border_radius=8)
-        label = self.font.render(self.text, True, COLOR_WHITE)
-        surf.blit(
-            label,
-            (
-                self.rect.centerx - label.get_width() // 2,
-                self.rect.centery - label.get_height() // 2,
-            ),
-        )
-
-    def is_clicked(self, event):
-        return (
-            event.type == pygame.MOUSEBUTTONDOWN
-            and event.button == 1
-            and self.rect.collidepoint(event.pos)
-        )
-
-
-class Bullet:
-    def __init__(self, x, y, vx, vy, damage, speed, status=None):
-        self.x = x
-        self.y = y
-        l = math.hypot(vx, vy) or 1
-        self.vx = vx / l * speed
-        self.vy = vy / l * speed
-        self.damage = damage
-        self.radius = BULLET_RADIUS
-        self.piercing = False
-        self.pierce_left = 0
-        self.status = status or {}
-
-    def update(self, dt):
-        self.x += self.vx * dt * FPS
-        self.y += self.vy * dt * FPS
-
-    def draw(self, surf, cam):
-        sx = int(self.x - cam[0])
-        sy = int(self.y - cam[1])
-        pygame.draw.circle(surf, COLOR_BULLET, (sx, sy), self.radius)
-
-    def offscreen(self, cam):
-        sx = self.x - cam[0]
-        sy = self.y - cam[1]
-        m = 100
-        return sx < -m or sx > WIDTH + m or sy < -m or sy > HEIGHT + m
-
-
-class Enemy:
-    # type: "normal", "tank", "fast"
-    def __init__(self, x, y, hp, speed, kind="normal"):
-        self.x = x
-        self.y = y
-        self.hp = hp
-        self.speed = speed
-        base_r = ENEMY_RADIUS
-        if kind == "boss":
-            base_r = int(ENEMY_RADIUS * 2.2)
-        elif kind == "bruiser":
-            base_r = int(ENEMY_RADIUS * 1.4)
-        elif kind == "sprinter":
-            base_r = int(ENEMY_RADIUS * 0.9)
-        self.radius = base_r
-        self.kind = kind
-        self.flash_timer = 0.0
-        self.ice_timer = 0.0
-        self.burn_timer = 0.0
-        self.poison_timer = 0.0
-        self.burn_dps = 0.0
-        self.poison_dps = 0.0
-
-    def update(self, dt, player_pos):
-        if self.flash_timer > 0:
-            self.flash_timer -= dt
-        if self.ice_timer > 0:
-            self.ice_timer -= dt
-        if self.burn_timer > 0:
-            self.burn_timer -= dt
-            self.hp -= self.burn_dps * dt
-        if self.poison_timer > 0:
-            self.poison_timer -= dt
-            self.hp -= self.poison_dps * dt
-        px, py = player_pos
-        dx = px - self.x
-        dy = py - self.y
-        l = math.hypot(dx, dy) or 1
-        speed_mult = 0.55 if self.ice_timer > 0 else 1.0
-        self.x += dx / l * self.speed * speed_mult * dt * FPS
-        self.y += dy / l * self.speed * speed_mult * dt * FPS
-
-    def draw(self, surf, cam):
-        sx = int(self.x - cam[0])
-        sy = int(self.y - cam[1])
-        if self.kind == "tank":
-            col = COLOR_ENEMY_TANK
-        elif self.kind == "fast":
-            col = COLOR_ENEMY_FAST
-        elif self.kind == "shooter":
-            col = (180, 120, 255)
-        elif self.kind == "sprinter":
-            col = (255, 160, 160)
-        elif self.kind == "bruiser":
-            col = (200, 90, 60)
-        elif self.kind == "boss":
-            col = (255, 120, 40)
-        else:
-            col = COLOR_ENEMY
-        if self.flash_timer > 0:
-            col = COLOR_WHITE
-        pygame.draw.circle(surf, col, (sx, sy), self.radius)
-
-
-class XPOrb:
-    def __init__(self, x, y, xp):
-        self.x = x
-        self.y = y
-        self.radius = XP_RADIUS
-        self.xp = xp
-
-    def update(self, dt, player_pos):
-        px, py = player_pos
-        dx = px - self.x
-        dy = py - self.y
-        d = math.hypot(dx, dy) or 1
-        if d < 160:
-            speed = 6
-            self.x += dx / d * speed * dt * FPS
-            self.y += dy / d * speed * dt * FPS
-
-    def draw(self, surf, cam):
-        sx = int(self.x - cam[0])
-        sy = int(self.y - cam[1])
-        pygame.draw.circle(surf, COLOR_XP, (sx, sy), self.radius)
-
-
-class GasPickup:
-    def __init__(self, x, y, duration=3.0):
-        self.x = x
-        self.y = y
-        self.radius = GAS_RADIUS
-        self.duration = duration  # seconds buff length
-
-    def draw(self, surf, cam):
-        sx = int(self.x - cam[0])
-        sy = int(self.y - cam[1])
-        pygame.draw.circle(surf, COLOR_GAS, (sx, sy), self.radius, width=2)
-        pygame.draw.circle(surf, COLOR_GAS, (sx, sy), self.radius // 2)
-
-
-class Player:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.radius = PLAYER_RADIUS
-
-        # hearts: 4 hearts by default
-        self.hearts = 4
-        self.max_hearts = 4
-
-        self.speed = 5.0
-        self.base_speed = self.speed
-        self.fire_rate = 5.0
-        self.fire_cd = 1.0 / self.fire_rate
-        self.time_since_shot = 0.0
-        self.bullet_speed = 11.0
-        self.damage = 10
-
-        # firing pattern
-        self.bullet_count = 1
-        self.spread_angle_deg = 8.0
-        self.piercing = False
-        self.back_shot = False
-        self.back_extra = False
-        self.bullet_status = {"ice": False, "burn": False, "poison": False}
-
-        # gas boost
-        self.gas_timer = 0.0
-        self.gas_speed_mult = 1.8
-        self.gas_fire_mult = 1.7
-
-        # progression
-        self.level = 1
-        self.xp = 0
-        self.xp_to_level = XP_PER_LEVEL
-        self.kills = 0
-
-        # ammo
-        self.mag_size = 12
-        self.ammo = self.mag_size
-        self.reload_time = 1.2
-        self.reload_timer = 0.0
-
-        self.level_ups_since_reward = 0
-        self.invuln = 0.0  # seconds of i-frames
-        self.hit_flash = 0.0
-
-    @property
-    def hp(self):
-        return self.hearts
-
-    @property
-    def max_hp(self):
-        return self.max_hearts
-
-    def update(self, dt, keys):
-        if self.invuln > 0:
-            self.invuln -= dt
-        if self.hit_flash > 0:
-            self.hit_flash -= dt
-        if self.reload_timer > 0:
-            self.reload_timer -= dt
-            if self.reload_timer <= 0:
-                self.ammo = self.mag_size
-
-        # gas buff timer
-        if self.gas_timer > 0:
-            self.gas_timer -= dt
-            if self.gas_timer <= 0:
-                # reset stats when gas ends
-                self.speed = self.base_speed
-                self.fire_rate = 5.0
-                self.fire_cd = 1.0 / self.fire_rate
-
-        vx = 0
-        vy = 0
-        if keys[pygame.K_w]:
-            vy -= 1
-        if keys[pygame.K_s]:
-            vy += 1
-        if keys[pygame.K_a]:
-            vx -= 1
-        if keys[pygame.K_d]:
-            vx += 1
-        l = math.hypot(vx, vy) or 1
-        if vx or vy:
-            self.x += vx / l * self.speed * dt * FPS
-            self.y += vy / l * self.speed * dt * FPS
-        half = WORLD_SIZE / 2
-        self.x = clamp(self.x, -half, half)
-        self.y = clamp(self.y, -half, half)
-        self.time_since_shot += dt
-
-    def can_shoot(self):
-        return self.time_since_shot >= self.fire_cd and self.ammo > 0 and self.reload_timer <= 0
-
-    def shoot(self, target_world_pos):
-        self.time_since_shot = 0.0
-        self.ammo = max(0, self.ammo - 1)
-        tx, ty = target_world_pos
-        dx = tx - self.x
-        dy = ty - self.y
-        base_angle = math.atan2(dy, dx)
-
-        if self.bullet_count == 1:
-            angles = [base_angle]
-        else:
-            total_spread = math.radians(self.spread_angle_deg) * (self.bullet_count - 1)
-            start = base_angle - total_spread / 2
-            step = total_spread / max(1, self.bullet_count - 1)
-            angles = [start + i * step for i in range(self.bullet_count)]
-
-        bullets = []
-        status = {
-            "ice": self.bullet_status["ice"],
-            "burn": self.bullet_status["burn"],
-            "poison": self.bullet_status["poison"],
-        }
-
-        for a in angles:
-            vx = math.cos(a)
-            vy = math.sin(a)
-            b = Bullet(self.x, self.y, vx, vy, self.damage, self.bullet_speed, status=status.copy())
-            b.piercing = self.piercing
-            b.pierce_left = 1 if self.piercing else 0
-            bullets.append(b)
-
-        if self.back_shot:
-            back_angle = base_angle + math.pi
-            extras = 1 + (1 if self.back_extra else 0)
-            for i in range(extras):
-                offset = math.radians(6 * (i - extras // 2)) if extras > 1 else 0
-                vx = math.cos(back_angle + offset)
-                vy = math.sin(back_angle + offset)
-                b = Bullet(self.x, self.y, vx, vy, self.damage, self.bullet_speed, status=status.copy())
-                b.piercing = self.piercing
-                b.pierce_left = 1 if self.piercing else 0
-                bullets.append(b)
-        if self.ammo <= 0:
-            self.reload_timer = self.reload_time
-        return bullets
-
-    def draw(self, surf):
-        px = WIDTH // 2
-        py = HEIGHT // 2
-        mx, my = pygame.mouse.get_pos()
-        ang = math.atan2(my - py, mx - px)
-        ca = math.cos(ang)
-        sa = math.sin(ang)
-        r = self.radius
-        if self.invuln > 0 and int(self.invuln * 15) % 2 == 0:
-            return  # blink while invulnerable
-        color = COLOR_WHITE if self.hit_flash > 0 else COLOR_PLAYER
-        p1 = (px + ca * r, py + sa * r)
-        p2 = (px - sa * r * 0.7, py + ca * r * 0.7)
-        p3 = (px + sa * r * 0.7, py - ca * r * 0.7)
-        pygame.draw.polygon(surf, color, [p1, p2, p3])
-
-    def take_damage(self, hearts=1):
-        if self.invuln > 0:
-            return
-        self.hearts = clamp(self.hearts - hearts, 0, self.max_hearts)
-        self.invuln = 1.0  # 1s i-frames after hit
-        self.hit_flash = 0.2
-
-    def heal(self, hearts=1):
-        self.hearts = clamp(self.hearts + hearts, 0, self.max_hearts)
-
-    def add_heart_container(self):
-        self.max_hearts += 1
-        self.hearts = self.max_hearts
-
-    def add_xp(self, amt):
-        self.xp += amt
-        leveled = False
-        while self.xp >= self.xp_to_level:
-            self.xp -= self.xp_to_level
-            self.level += 1
-            self.level_ups_since_reward += 1
-            # progressively slower leveling
-            self.xp_to_level = int(self.xp_to_level * XP_LEVEL_GROWTH)
-            leveled = True
-        return leveled
-
-    def apply_gas(self, duration):
-        self.gas_timer = duration
-        self.speed = self.base_speed * self.gas_speed_mult
-        self.fire_rate = 5.0 * self.gas_fire_mult
-        self.fire_cd = 1.0 / self.fire_rate
-
-
-POWERUPS = [
-    "bullet_2",
-    "bullet_3",
-    "bullet_4",
-    "bullet_5",
-    "bullet_6",
-    "backshot",
-    "backshot_plus",
-    "pierce",
-    "damage_up",
-    "move_10",
-    "move_15",
-    "move_20",
-    "hp_up",
-    "ice_rounds",
-    "burn_rounds",
-    "poison_rounds",
-]
-
-
-def apply_powerup(player: Player, pid: str):
-    if pid == "bullet_2":
-        player.bullet_count = max(player.bullet_count, 2)
-    elif pid == "bullet_3":
-        player.bullet_count = max(player.bullet_count, 3)
-    elif pid == "bullet_4":
-        player.bullet_count = max(player.bullet_count, 4)
-    elif pid == "bullet_5":
-        player.bullet_count = max(player.bullet_count, 5)
-    elif pid == "bullet_6":
-        player.bullet_count = max(player.bullet_count, 6)
-    elif pid == "backshot":
-        player.back_shot = True
-    elif pid == "backshot_plus":
-        player.back_shot = True
-        player.back_extra = True
-    elif pid == "pierce":
-        player.piercing = True
-    elif pid == "damage_up":
-        player.damage += 6
-    elif pid == "move_10":
-        player.base_speed *= 1.10
-        player.speed = player.base_speed
-    elif pid == "move_15":
-        player.base_speed *= 1.15
-        player.speed = player.base_speed
-    elif pid == "move_20":
-        player.base_speed *= 1.20
-        player.speed = player.base_speed
-    elif pid == "hp_up":
-        player.add_heart_container()
-    elif pid == "ice_rounds":
-        player.bullet_status["ice"] = True
-    elif pid == "burn_rounds":
-        player.bullet_status["burn"] = True
-    elif pid == "poison_rounds":
-        player.bullet_status["poison"] = True
-
-
-def powerup_name(pid: str) -> str:
-    names = {
-        "bullet_2": "Double Shot",
-        "bullet_3": "Triple Shot",
-        "bullet_4": "Quad Shot",
-        "bullet_5": "Penta Shot",
-        "bullet_6": "Hexa Shot",
-        "backshot": "Rear Gun",
-        "backshot_plus": "Rear Barrage",
-        "pierce": "Piercing Rounds",
-        "damage_up": "Overcharged Rounds",
-        "move_10": "Thrusters I",
-        "move_15": "Thrusters II",
-        "move_20": "Thrusters III",
-        "hp_up": "Extra Heart",
-        "ice_rounds": "Cryo Rounds",
-        "burn_rounds": "Incendiary",
-        "poison_rounds": "Toxic Rounds",
-    }
-    return names[pid]
-
-
-def powerup_desc(pid: str) -> str:
-    desc = {
-        "bullet_2": "+1 projectile",
-        "bullet_3": "+2 projectiles",
-        "bullet_4": "+3 projectiles",
-        "bullet_5": "+4 projectiles",
-        "bullet_6": "+5 projectiles",
-        "backshot": "Shoot one backward",
-        "backshot_plus": "Shoot two backward",
-        "pierce": "Bullets pierce one enemy",
-        "damage_up": "+6 bullet damage",
-        "move_10": "+10% move speed",
-        "move_15": "+15% move speed",
-        "move_20": "+20% move speed",
-        "hp_up": "+1 max heart",
-        "ice_rounds": "Slow enemies on hit",
-        "burn_rounds": "Apply burn DoT",
-        "poison_rounds": "Apply poison DoT",
-    }
-    return desc[pid]
+from game_constants import *
+from game_entities import Bullet, Enemy, XPOrb, GasPickup, EvolutionPickup, Player
+from game_powerups import POWERUPS, EVOLUTIONS, apply_powerup, apply_evolution, powerup_name, powerup_desc, evolution_name, evolution_desc, available_powerups
+from game_ui import Button
 
 
 # --- main game ---
@@ -670,7 +153,7 @@ class Game:
         slider_h = 12
         base_y = self.h // 2 - 10
         self.slider_bg_rect = pygame.Rect(self.w // 2 - slider_w // 2, base_y, slider_w, slider_h)
-        self.slider_sfx_rect = pygame.Rect(self.w // 2 - slider_w // 2, base_y + 40, slider_w, slider_h)
+        self.slider_sfx_rect = pygame.Rect(self.w // 2 - slider_w // 2, base_y + 60, slider_w, slider_h)
         # pause overlay sliders
         p_slider_w = 260
         p_slider_h = 10
@@ -680,6 +163,10 @@ class Game:
         self.fullscreen = False
         self.window_size_index = 0
         self.show_size_dropdown = False
+
+        # dev mode controls
+        self.dev_mode = False
+        self.dev_power_queue = []
 
         btn_y = self.h // 4 + 80
         self.btn_window_dropdown = Button(
@@ -733,6 +220,8 @@ class Game:
         self.enemies = []
         self.orbs = []
         self.gas_pickups = []
+        self.evolution_pickups = []
+        self.minions = []
         self.enemy_bullets = []
         self.elapsed_time = 0.0
         self.spawn_timer = 0.0
@@ -747,8 +236,22 @@ class Game:
         self.game_over_audio_triggered = False
         self.defeat_music_timer = None
         self.boost_effect_timer = 0.0
+        self.boost_dir = (0.0, -1.0)
+        self.status_particles = []
+        self.boost_particles = []
         self.damage_texts = []
+        self.laser_segment = None
+        self.evolution_options = []
         self.bosses_spawned = 0
+        self.vision_dim = 0.22
+
+        if self.dev_mode:
+            self.player.level = 40
+            self.player.xp = 0
+            self.player.xp_to_level = XP_PER_LEVEL
+            self.dev_power_queue = list(POWERUPS)
+        else:
+            self.dev_power_queue.clear()
 
     def run(self):
         running = True
@@ -801,16 +304,32 @@ class Game:
         slider_h = 12
         base_y = self.h // 2 - 10
         self.slider_bg_rect.update(self.w // 2 - slider_w // 2, base_y, slider_w, slider_h)
-        self.slider_sfx_rect.update(self.w // 2 - slider_w // 2, base_y + 40, slider_w, slider_h)
+        self.slider_sfx_rect.update(self.w // 2 - slider_w // 2, base_y + 60, slider_w, slider_h)
         btn_y = self.h // 4 + 80
         self.btn_window_dropdown.rect.update(self.w // 2 - 220, btn_y, 200, 44)
         self.btn_fullscreen.rect.update(self.w // 2 + 20, btn_y, 200, 44)
+
+    def _layout_pause_sliders(self):
+        p_slider_w = 220
+        p_slider_h = 10
+        title_y = self.h // 2 - self.font_large.get_height() - 120
+        start_y = title_y + self.font_large.get_height() + 40
+        self.pause_music_rect.update(self.w // 2 - p_slider_w // 2, start_y, p_slider_w, p_slider_h)
+        self.pause_sfx_rect.update(self.w // 2 - p_slider_w // 2, start_y + 50, p_slider_w, p_slider_h)
+        btn_base_y = start_y + 90
+        self.btn_pause_resume.rect.update(self.w // 2 - 110, btn_base_y, 220, 44)
+        self.btn_pause_reset.rect.update(self.w // 2 - 110, btn_base_y + 50, 220, 44)
+        self.btn_pause_quit.rect.update(self.w // 2 - 110, btn_base_y + 100, 220, 44)
+        return title_y
 
     def handle_event(self, e):
         if self.state == STATE_MENU:
             if self.btn_start.is_clicked(e):
                 self.reset_game()
-                self.state = STATE_PLAYING
+                if self.dev_mode:
+                    self.roll_levelup()
+                else:
+                    self.state = STATE_PLAYING
             elif self.btn_settings.is_clicked(e):
                 self.state = STATE_SETTINGS
             elif self.btn_quit.is_clicked(e):
@@ -818,7 +337,10 @@ class Game:
         elif self.state == STATE_GAME_OVER:
             if self.btn_restart.is_clicked(e):
                 self.reset_game()
-                self.state = STATE_PLAYING
+                if self.dev_mode:
+                    self.roll_levelup()
+                else:
+                    self.state = STATE_PLAYING
             elif self.btn_main_menu.is_clicked(e):
                 self.state = STATE_MENU
         elif self.state == STATE_LEVEL_UP:
@@ -834,6 +356,24 @@ class Game:
                     rect = pygame.Rect(start_x + i * (w + gap), y, w, h)
                     if rect.collidepoint(mx, my):
                         apply_powerup(self.player, pid)
+                        if self.dev_mode and self.dev_power_queue:
+                            self.roll_levelup()
+                        else:
+                            self.state = STATE_PLAYING
+                        break
+        elif self.state == STATE_EVOLUTION:
+            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                mx, my = e.pos
+                w = 260
+                h = 120
+                gap = 20
+                total_w = 3 * w + 2 * gap
+                start_x = WIDTH // 2 - total_w // 2
+                y = HEIGHT // 2 - h // 2
+                for i, eid in enumerate(self.evolution_options):
+                    rect = pygame.Rect(start_x + i * (w + gap), y, w, h)
+                    if rect.collidepoint(mx, my):
+                        apply_evolution(self.player, eid)
                         self.state = STATE_PLAYING
                         break
         elif self.state == STATE_SETTINGS:
@@ -872,18 +412,33 @@ class Game:
                             self._apply_display_mode()
                     else:
                         self.show_size_dropdown = False
+
+                # dev toggle
+                dev_rect = self._dev_toggle_rect()
+                if dev_rect.collidepoint(mx, my):
+                    self.dev_mode = not self.dev_mode
+                    if self.dev_mode:
+                        self.dev_power_queue = list(POWERUPS)
+                    else:
+                        self.dev_power_queue.clear()
         elif self.state == STATE_PLAYING:
+            if e.type == pygame.KEYDOWN and e.key == pygame.K_r:
+                self.player.start_reload()
             if self.btn_pause.is_clicked(e):
                 audio.play_sfx(audio.snd_pause)
                 self.state = STATE_PAUSED
         elif self.state == STATE_PAUSED:
+            self._layout_pause_sliders()
             if self.btn_pause_resume.is_clicked(e):
                 audio.play_sfx(audio.snd_unpause)
                 self.state = STATE_PLAYING
             elif self.btn_pause_reset.is_clicked(e):
                 self.reset_game()
                 audio.play_sfx(audio.snd_unpause)
-                self.state = STATE_PLAYING
+                if self.dev_mode:
+                    self.roll_levelup()
+                else:
+                    self.state = STATE_PLAYING
             elif self.btn_pause_quit.is_clicked(e):
                 audio.play_sfx(audio.snd_unpause)
                 self.state = STATE_MENU
@@ -957,7 +512,7 @@ class Game:
             return
 
         # in-game music (includes paused + level-up overlay)
-        if self.state in (STATE_PLAYING, STATE_LEVEL_UP, STATE_PAUSED):
+        if self.state in (STATE_PLAYING, STATE_LEVEL_UP, STATE_PAUSED, STATE_EVOLUTION):
             self.game_over_audio_triggered = False
             self.defeat_music_timer = None
             if self.current_music_tag != "ingame":
@@ -996,7 +551,75 @@ class Game:
         keys = pygame.key.get_pressed()
         self.player.update(dt, keys)
 
+        # manage laser ultimate timers
+        if self.player.laser_cooldown > 0:
+            self.player.laser_cooldown = max(0.0, self.player.laser_cooldown - dt)
+        if self.player.laser_active:
+            self.player.laser_timer -= dt
+            if self.player.laser_timer <= 0:
+                self.player.laser_active = False
+                self.player.laser_cooldown = self.player.laser_cooldown_max
+        elif keys[pygame.K_SPACE] and self.player.laser_cooldown <= 0:
+            self.player.laser_active = True
+            self.player.laser_timer = self.player.laser_duration
+            self.laser_segment = None
+
         cam = (self.player.x - WIDTH // 2, self.player.y - HEIGHT // 2)
+
+        # boost trail particles
+        if self.player.boosting:
+            target_dx, target_dy = self.player.move_dir
+            if abs(target_dx) < 0.01 and abs(target_dy) < 0.01:
+                target_dx, target_dy = self.boost_dir
+            lerp = 0.25
+            mdx = self.boost_dir[0] * (1 - lerp) + target_dx * lerp
+            mdy = self.boost_dir[1] * (1 - lerp) + target_dy * lerp
+            mag = math.hypot(mdx, mdy) or 1.0
+            mdx, mdy = mdx / mag, mdy / mag
+            self.boost_dir = (mdx, mdy)
+
+            back_ang = math.atan2(mdy, mdx) + math.pi
+            for _ in range(12):
+                offset_ang = back_ang + random.uniform(-0.18, 0.18)
+                spd = random.uniform(28, 70)
+                size = random.uniform(self.player.radius * 0.5, self.player.radius * 0.9)
+                self.boost_particles.append({
+                    "x": self.player.x - mdx * self.player.radius * 1.02,
+                    "y": self.player.y - mdy * self.player.radius * 1.02,
+                    "vx": math.cos(offset_ang) * spd,
+                    "vy": math.sin(offset_ang) * spd,
+                    "life": random.uniform(0.05, 0.09),
+                    "life_max": 0.09,
+                    "color": (140, 240, 255),
+                    "rot": random.uniform(0, math.tau),
+                    "rot_speed": random.uniform(-9.0, 9.0),
+                    "size": size,
+                })
+
+            # ease vision dimmer while boosting
+            target_dim = 0.08 if self.player.boosting else 0.22
+            self.vision_dim += (target_dim - self.vision_dim) * dt * 5.0
+
+        # update particles
+        for p in list(self.boost_particles):
+            p["life"] -= dt
+            p["x"] += p["vx"] * dt * FPS
+            p["y"] += p["vy"] * dt * FPS
+            p["vx"] *= 0.72
+            p["vy"] *= 0.72
+            p["rot"] = p.get("rot", 0.0) + p.get("rot_speed", 0.0) * dt
+            if p["life"] <= 0:
+                self.boost_particles.remove(p)
+        for p in list(self.status_particles):
+            p["life"] += dt
+            p["x"] += p["vx"] * dt * FPS
+            p["y"] += p["vy"] * dt * FPS
+            p["vx"] *= 0.9
+            p["vy"] *= 0.9
+            if p["life"] >= p.get("life_max", 0.6):
+                self.status_particles.remove(p)
+
+        self._update_minions(dt)
 
         # shooting
         if pygame.mouse.get_pressed()[0] and self.player.can_shoot():
@@ -1005,6 +628,17 @@ class Game:
             new_bullets = self.player.shoot(world_target)
             self.bullets.extend(new_bullets)
             audio.play_sfx(audio.snd_shoot)
+
+        if self.player.guided_shots and self.enemies:
+            for b in self.bullets:
+                nearest = min(self.enemies, key=lambda en: (en.x - b.x) ** 2 + (en.y - b.y) ** 2)
+                dx = nearest.x - b.x
+                dy = nearest.y - b.y
+                l = math.hypot(dx, dy) or 1.0
+                speed = math.hypot(b.vx, b.vy) or 1.0
+                lerp = 0.08
+                b.vx = b.vx * (1 - lerp) + (dx / l * speed) * lerp
+                b.vy = b.vy * (1 - lerp) + (dy / l * speed) * lerp
 
         for b in self.bullets:
             b.update(dt)
@@ -1032,7 +666,57 @@ class Game:
         for e in self.enemies:
             e.update(dt, (self.player.x, self.player.y))
         for o in self.orbs:
-            o.update(dt, (self.player.x, self.player.y))
+            o.update(dt, self.player)
+
+        # aura damage around the player
+        if self.player.aura_radius > 0 and self.player.aura_dps > 0:
+            rad_sq = self.player.aura_radius * self.player.aura_radius
+            for en in self.enemies:
+                dx = en.x - self.player.x
+                dy = en.y - self.player.y
+                if dx * dx + dy * dy <= rad_sq:
+                    en.hp -= self.player.aura_dps * dt
+                    if random.random() < 0.15:
+                        self._emit_status_particle(en, "fire")
+
+        self._apply_laser_damage(dt, cam)
+
+        # ambient status particles while effects are active
+        for en in self.enemies:
+            if en.burn_timer > 0 and random.random() < 0.55:
+                self._emit_status_particle(en, "fire")
+            if en.poison_timer > 0 and random.random() < 0.55:
+                self._emit_status_particle(en, "poison")
+            if en.ice_timer > 0 and random.random() < 0.5:
+                self._emit_status_particle(en, "ice")
+
+        # DoT ticks with floating numbers and FX
+        tick = 0.35
+        for en in list(self.enemies):
+            if en.burn_timer > 0 and en.burn_dps > 0:
+                en.burn_tick += dt
+                while en.burn_tick >= tick:
+                    en.burn_tick -= tick
+                    dmg = en.burn_dps * tick
+                    en.hp -= dmg
+                    self.damage_texts.append({"x": en.x + random.uniform(-4, 4), "y": en.y - 8, "val": max(1, int(dmg + 0.5)), "life": 0.5, "color": (255, 110, 80)})
+                    self._spawn_status_fx(en.x, en.y, kind="fire")
+            if en.poison_timer > 0 and en.poison_dps > 0:
+                en.poison_tick += dt
+                while en.poison_tick >= tick:
+                    en.poison_tick -= tick
+                    dmg = en.poison_dps * tick
+                    en.hp -= dmg
+                    self.damage_texts.append({"x": en.x + random.uniform(-4, 4), "y": en.y - 8, "val": max(1, int(dmg + 0.5)), "life": 0.5, "color": (140, 255, 160)})
+                    self._spawn_status_fx(en.x, en.y, kind="poison")
+            if en.ice_timer > 0 and en.ice_dps > 0:
+                en.ice_tick += dt
+                while en.ice_tick >= tick:
+                    en.ice_tick -= tick
+                    dmg = en.ice_dps * tick
+                    en.hp -= dmg
+                    self.damage_texts.append({"x": en.x + random.uniform(-4, 4), "y": en.y - 8, "val": max(1, int(dmg + 0.5)), "life": 0.5, "color": (170, 210, 255)})
+                    self._spawn_status_fx(en.x, en.y, kind="ice")
 
         # DoT deaths
         for en in list(self.enemies):
@@ -1042,11 +726,23 @@ class Game:
                 self.orbs.append(XPOrb(en.x, en.y, XP_PER_ORB))
                 if random.random() < 0.05:
                     self.gas_pickups.append(GasPickup(en.x, en.y))
+                if self.player.burn_chain:
+                    for other in self.enemies:
+                        if other is en:
+                            continue
+                        dx = other.x - en.x
+                        dy = other.y - en.y
+                        if dx * dx + dy * dy <= 140 * 140:
+                            other.burn_timer = max(other.burn_timer, 3.0)
+                            other.burn_dps = max(other.burn_dps, self.player.damage * 0.2 * self.player.burn_bonus_mult)
+                if getattr(en, "kind", "") == "boss":
+                    self._spawn_evolution_pickup(en.x, en.y)
                 self.enemies.remove(en)
 
         # enemy shooting
         for en in self.enemies:
-            if getattr(en, "kind", "") in ("shooter", "boss", "elite_shooter"):
+            can_shoot = (getattr(en, "kind", "") in ("shooter", "elite_shooter")) or (getattr(en, "kind", "") == "boss" and getattr(en, "boss_stage", 0) >= 3)
+            if can_shoot:
                 if not hasattr(en, "shoot_cd"):
                     en.shoot_cd = random.uniform(1.0, 2.4)
                 en.shoot_cd -= dt
@@ -1076,6 +772,8 @@ class Game:
         for b in list(self.bullets):
             for en in list(self.enemies):
                 if circle_collision(b.x, b.y, b.radius, en.x, en.y, en.radius):
+                    extra_damage = 0
+                    status_color = COLOR_YELLOW
                     en.hp -= b.damage
                     en.flash_timer = 0.15
                     dx = en.x - b.x
@@ -1084,21 +782,55 @@ class Game:
                     push = 12
                     en.x += dx / l * push
                     en.y += dy / l * push
-                    self.damage_texts.append({"x": en.x + random.uniform(-6, 6), "y": en.y - 10, "val": b.damage, "life": 0.6})
+                    # status bonus damage
+                    if b.status.get("ice") and en.ice_timer > 0:
+                        extra_damage += self.player.ice_bonus_damage
+                        status_color = (150, 200, 255)
+                    if b.status.get("burn"):
+                        status_color = (255, 120, 90)
+                        if en.burn_timer > 0 and self.player.burn_sear_bonus > 0:
+                            extra_damage += int(b.damage * self.player.burn_sear_bonus)
+                    if b.status.get("poison"):
+                        status_color = (180, 130, 255)
+                        if en.poison_timer > 0:
+                            extra_damage += int(b.damage * 0.2 * self.player.poison_bonus_mult)
+                    if extra_damage > 0:
+                        en.hp -= extra_damage
+                    self.damage_texts.append({"x": en.x + random.uniform(-6, 6), "y": en.y - 10, "val": b.damage + extra_damage, "life": 0.6, "color": status_color})
                     # apply status effects
                     if b.status.get("ice"):
-                        en.ice_timer = max(en.ice_timer, 1.2)
+                        en.ice_timer = max(en.ice_timer, 2.0)
+                        en.ice_dps = max(en.ice_dps, self.player.ice_bonus_damage * 0.8)
+                        self._spawn_status_fx(en.x, en.y, kind="ice")
                     if b.status.get("burn"):
-                        en.burn_timer = max(en.burn_timer, 2.5)
-                        en.burn_dps = max(en.burn_dps, self.player.damage * 0.35)
+                        en.burn_timer = max(en.burn_timer, 3.0)
+                        en.burn_dps = max(en.burn_dps, self.player.damage * 0.26 * self.player.burn_bonus_mult)
+                        self._spawn_status_fx(en.x, en.y, kind="fire")
                     if b.status.get("poison"):
-                        en.poison_timer = max(en.poison_timer, 3.5)
-                        en.poison_dps = max(en.poison_dps, self.player.damage * 0.25)
-                    if b.piercing and b.pierce_left > 0:
-                        b.pierce_left -= 1
+                        en.poison_timer = max(en.poison_timer, 5.0)
+                        en.poison_dps = max(en.poison_dps, self.player.damage * 0.22 * self.player.poison_bonus_mult)
+                        self._spawn_status_fx(en.x, en.y, kind="poison")
+                    killed = en.hp <= 0
+
+                    if b.piercing:
+                        if b.pierce_on_kill:
+                            if killed:
+                                b.pierce_left -= 1
+                                if b.pierce_left < 0 and b in self.bullets:
+                                    self.bullets.remove(b)
+                            else:
+                                if b in self.bullets:
+                                    self.bullets.remove(b)
+                        else:
+                            if b.pierce_left > 0:
+                                b.pierce_left -= 1
+                            else:
+                                if b in self.bullets:
+                                    self.bullets.remove(b)
                     else:
                         if b in self.bullets:
                             self.bullets.remove(b)
+
                     if en.hp <= 0:
                         self.kills += 1
                         self.player.kills += 1
@@ -1106,6 +838,17 @@ class Game:
                         # chance to drop gas
                         if random.random() < 0.05:
                             self.gas_pickups.append(GasPickup(en.x, en.y))
+                        if self.player.burn_chain:
+                            for other in self.enemies:
+                                if other is en:
+                                    continue
+                                dx = other.x - en.x
+                                dy = other.y - en.y
+                                if dx * dx + dy * dy <= 140 * 140:
+                                    other.burn_timer = max(other.burn_timer, 3.0)
+                                    other.burn_dps = max(other.burn_dps, self.player.damage * 0.2 * self.player.burn_bonus_mult)
+                        if getattr(en, "kind", "") == "boss":
+                            self._spawn_evolution_pickup(en.x, en.y)
                         self.enemies.remove(en)
                         audio.play_sfx(audio.snd_enemy_death)
                     break
@@ -1151,6 +894,12 @@ class Game:
                 self.boost_effect_timer = max(self.boost_effect_timer, g.duration)
                 self.gas_pickups.remove(g)
 
+        # evolution pickup collision
+        for ev in list(self.evolution_pickups):
+            if circle_collision(self.player.x, self.player.y, self.player.radius, ev.x, ev.y, ev.radius):
+                self.evolution_pickups.remove(ev)
+                self.roll_evolution()
+
     def _spawn_death_fx(self, x, y):
         self.death_fx.clear()
         for _ in range(120):
@@ -1162,6 +911,152 @@ class Game:
                 "vy": math.sin(ang) * spd,
                 "life": random.uniform(0.5, 1.2),
             })
+
+    def _spawn_evolution_pickup(self, x, y):
+        self.evolution_pickups.append(EvolutionPickup(x, y))
+
+    def _spawn_status_fx(self, x, y, kind="fire", radius=10):
+        # small burst on hit; ambient handled separately per-frame
+        if kind == "fire":
+            color = (255, 110, 80)
+            vy_range = (-10, -4)
+            size_range = (2.0, 3.2)
+            life_range = (0.24, 0.36)
+        elif kind == "ice":
+            color = (170, 210, 255)
+            vy_range = (-3, 3)
+            size_range = (1.8, 3.0)
+            life_range = (0.22, 0.32)
+        else:  # poison
+            color = (140, 255, 160)
+            vy_range = (3, 7)
+            size_range = (2.0, 3.4)
+            life_range = (0.26, 0.38)
+
+        count = 8
+        for _ in range(count):
+            ang = random.uniform(0, math.tau)
+            r = random.uniform(0, radius * 0.6)
+            base_x = x + math.cos(ang) * r
+            base_y = y + math.sin(ang) * r
+            vx = random.uniform(-6, 6)
+            vy = random.uniform(*vy_range)
+            self.status_particles.append({
+                "x": base_x,
+                "y": base_y,
+                "vx": vx,
+                "vy": vy,
+                "life": 0.0,
+                "life_max": random.uniform(*life_range),
+                "color": color,
+                "kind": kind,
+                "size": random.uniform(*size_range),
+            })
+
+    def _emit_status_particle(self, en, kind: str):
+        rad = getattr(en, "radius", 10)
+        ang = random.uniform(0, math.tau)
+        r = random.uniform(0, rad * 0.7)
+        px = en.x + math.cos(ang) * r
+        py = en.y + math.sin(ang) * r
+
+        if kind == "fire":
+            color = (255, 110, 80)
+            vx = random.uniform(-4, 4)
+            vy = random.uniform(-7, -3)
+            size = random.uniform(1.6, 2.4)
+            life_max = random.uniform(0.18, 0.26)
+        elif kind == "ice":
+            color = (170, 210, 255)
+            vx = random.uniform(-3, 3)
+            vy = random.uniform(-3, 3)
+            size = random.uniform(1.5, 2.4)
+            life_max = random.uniform(0.18, 0.26)
+        else:  # poison
+            color = (140, 255, 160)
+            vx = random.uniform(-3, 3)
+            vy = random.uniform(3, 7)
+            size = random.uniform(1.6, 2.4)
+            life_max = random.uniform(0.18, 0.26)
+
+        self.status_particles.append({
+            "x": px,
+            "y": py,
+            "vx": vx,
+            "vy": vy,
+            "life": 0.0,
+            "life_max": life_max,
+            "color": color,
+            "kind": kind,
+            "size": size,
+        })
+
+    def _apply_laser_damage(self, dt, cam):
+        if not self.player.laser_active:
+            self.laser_segment = None
+            return
+
+        mx, my = pygame.mouse.get_pos()
+        target = (cam[0] + mx, cam[1] + my)
+        px, py = self.player.x, self.player.y
+        dx = target[0] - px
+        dy = target[1] - py
+        dist = math.hypot(dx, dy) or 1.0
+        dir_x = dx / dist
+        dir_y = dy / dist
+        length = 900
+        end_x = px + dir_x * length
+        end_y = py + dir_y * length
+        self.laser_segment = (px, py, end_x, end_y)
+
+        width = 42
+        dps = self.player.damage * 4.0
+
+        def point_segment_dist_sq(x0, y0, x1, y1, x2, y2):
+            # distance from point (x0,y0) to segment (x1,y1)-(x2,y2)
+            pxv = x2 - x1
+            pyv = y2 - y1
+            l2 = pxv * pxv + pyv * pyv or 1.0
+            t = ((x0 - x1) * pxv + (y0 - y1) * pyv) / l2
+            t = max(0.0, min(1.0, t))
+            proj_x = x1 + t * pxv
+            proj_y = y1 + t * pyv
+            dxp = x0 - proj_x
+            dyp = y0 - proj_y
+            return dxp * dxp + dyp * dyp
+
+        for en in self.enemies:
+            if point_segment_dist_sq(en.x, en.y, px, py, end_x, end_y) <= width * width:
+                en.hp -= dps * dt
+                en.flash_timer = 0.05
+                en.burn_timer = max(en.burn_timer, 2.0)
+                en.burn_dps = max(en.burn_dps, self.player.damage * 0.18 * self.player.burn_bonus_mult)
+
+    def _update_minions(self, dt):
+        # maintain desired minion count
+        while len(self.minions) < self.player.minion_count:
+            self.minions.append({"angle": random.uniform(0, math.tau), "cd": random.uniform(0.2, 0.8)})
+        if len(self.minions) > self.player.minion_count:
+            self.minions = self.minions[: self.player.minion_count]
+
+        # pick closest enemy for targeting
+        target = None
+        if self.enemies:
+            target = min(self.enemies, key=lambda en: (en.x - self.player.x) ** 2 + (en.y - self.player.y) ** 2)
+
+        orbit_r = 70
+        for m in self.minions:
+            m["angle"] += dt * 1.6
+            m["cd"] -= dt
+            m["x"] = self.player.x + math.cos(m["angle"]) * orbit_r
+            m["y"] = self.player.y + math.sin(m["angle"]) * orbit_r
+            if target and m["cd"] <= 0:
+                dx = target.x - m["x"]
+                dy = target.y - m["y"]
+                b = Bullet(m["x"], m["y"], dx, dy, int(self.player.damage * 0.6 * self.player.minion_damage_mult), self.player.bullet_speed * 0.9, status=self.player.bullet_status.copy())
+                b.piercing = False
+                self.bullets.append(b)
+                m["cd"] = 0.9
 
     def spawn_enemy(self):
         half = WORLD_SIZE / 2
@@ -1182,6 +1077,7 @@ class Game:
         if int(t // 60) > self.bosses_spawned:
             self.bosses_spawned += 1
             kind = "boss"
+            boss_stage = self.bosses_spawned
         else:
             pool = ["normal", "fast", "tank"]
             weights = [0.45, 0.25, 0.2]
@@ -1195,6 +1091,7 @@ class Game:
                 pool.append("bruiser")
                 weights.append(0.2)
             kind = random.choices(pool, weights=weights, k=1)[0]
+            boss_stage = 0
 
         if kind == "tank":
             hp = int(ENEMY_BASE_HP * 3 * hp_scale)
@@ -1212,18 +1109,47 @@ class Game:
             hp = int(ENEMY_BASE_HP * 1.4 * hp_scale)
             speed = ENEMY_BASE_SPEED * 1.0 * speed_scale
         elif kind == "boss":
-            hp = int(ENEMY_BASE_HP * 10 * hp_scale)
-            speed = ENEMY_BASE_SPEED * 1.4 * speed_scale
+            if boss_stage == 1:
+                hp = int(ENEMY_BASE_HP * 14 * hp_scale)
+                speed = ENEMY_BASE_SPEED * 1.2 * speed_scale
+            elif boss_stage == 2:
+                hp = int(ENEMY_BASE_HP * 18 * hp_scale)
+                speed = ENEMY_BASE_SPEED * 1.45 * speed_scale
+            else:
+                hp = int(ENEMY_BASE_HP * 24 * hp_scale)
+                speed = ENEMY_BASE_SPEED * 1.6 * speed_scale
         else:
             hp = int(ENEMY_BASE_HP * 1.0 * hp_scale)
             speed = ENEMY_BASE_SPEED * 1.0 * speed_scale
 
-        self.enemies.append(Enemy(x, y, hp, speed, kind))
+        self.enemies.append(Enemy(x, y, hp, speed, kind, boss_stage=boss_stage))
 
     def roll_levelup(self):
-        self.levelup_options = random.sample(POWERUPS, k=3)
+        if self.dev_mode and self.dev_power_queue:
+            self.levelup_options = self.dev_power_queue[:3]
+            self.dev_power_queue = self.dev_power_queue[3:]
+        else:
+            pool = available_powerups(self.player)
+            if len(pool) >= 3:
+                self.levelup_options = random.sample(pool, k=3)
+            elif pool:
+                # allow duplicates if few options remain
+                self.levelup_options = random.choices(pool, k=min(3, len(pool)))
+            else:
+                self.levelup_options = []
         self.state = STATE_LEVEL_UP
         audio.play_sfx(audio.snd_level_up)
+
+    def roll_evolution(self):
+        self.evolution_options = random.sample(EVOLUTIONS, k=min(3, len(EVOLUTIONS)))
+        self.state = STATE_EVOLUTION
+        audio.play_sfx(audio.snd_level_up)
+
+    def _grant_dev_power(self, pid: str):
+        if not self.dev_mode:
+            return
+        if hasattr(self, "player") and self.player:
+            apply_powerup(self.player, pid)
 
     def get_camera(self):
         return (self.player.x - WIDTH // 2, self.player.y - HEIGHT // 2)
@@ -1265,12 +1191,15 @@ class Game:
         self.screen.fill(COLOR_BG)
         if self.state == STATE_MENU:
             self.draw_menu()
-        elif self.state in (STATE_PLAYING, STATE_LEVEL_UP, STATE_GAME_OVER, STATE_PAUSED, STATE_DEAD_ANIM):
+        elif self.state in (STATE_PLAYING, STATE_LEVEL_UP, STATE_EVOLUTION, STATE_GAME_OVER, STATE_PAUSED, STATE_DEAD_ANIM):
             self.draw_game_world()
             self.draw_boost_overlay()
+            self.draw_vision_overlay()
             self.draw_hud()
             if self.state == STATE_LEVEL_UP:
                 self.draw_levelup()
+            if self.state == STATE_EVOLUTION:
+                self.draw_evolution()
             if self.state == STATE_GAME_OVER:
                 self.draw_game_over()
             if self.state == STATE_PAUSED:
@@ -1292,10 +1221,64 @@ class Game:
         cam = self.get_camera()
         self.draw_background(cam)
 
+        # particles first so entities draw above
+        for p in self.boost_particles:
+            sx = int(p["x"] - cam[0])
+            sy = int(p["y"] - cam[1])
+            life_max = p.get("life_max", 0.35)
+            alpha = int(255 * max(0, min(1, p["life"] / life_max)))
+            size = p.get("size", 6)
+            rot = p.get("rot", 0.0)
+            surf = pygame.Surface((int(size * 2.6), int(size * 2.6)), pygame.SRCALPHA)
+            cx = size * 1.3
+            cy = size * 1.3
+            star_pts = []
+            for i in range(8):
+                ang = rot + math.tau * i / 8
+                r = size if i % 2 == 0 else size * 0.55
+                star_pts.append((cx + math.cos(ang) * r, cy + math.sin(ang) * r))
+            pygame.draw.polygon(surf, (*p["color"], alpha), star_pts)
+            self.screen.blit(surf, (int(sx - size * 1.3), int(sy - size * 1.3)))
+        for p in self.status_particles:
+            sx = int(p["x"] - cam[0])
+            sy = int(p["y"] - cam[1])
+            life_max = p.get("life_max", 0.6)
+            t = max(0.0, min(1.0, p["life"] / life_max))
+            fade = 1.0 - abs(t * 2 - 1)
+            alpha = int(220 * fade)
+            size = p.get("size", 5)
+            kind = p.get("kind", "spark")
+            color = p.get("color", (255, 255, 255))
+            surf = pygame.Surface((int(size * 3), int(size * 3)), pygame.SRCALPHA)
+            cx = int(size * 1.5)
+            cy = int(size * 1.5)
+            if kind == "fire":
+                pygame.draw.rect(surf, (*color, alpha), (cx - size * 0.4, cy - size, size * 0.8, size * 1.6))
+            elif kind == "ice":
+                pts = []
+                for i in range(6):
+                    ang = math.tau * i / 6
+                    r = size if i % 2 == 0 else size * 0.45
+                    pts.append((int(cx + math.cos(ang) * r), int(cy + math.sin(ang) * r)))
+                pygame.draw.polygon(surf, (*color, alpha), pts)
+            elif kind == "poison":
+                pygame.draw.circle(surf, (*color, alpha), (cx, cy), int(size))
+                pygame.draw.circle(surf, (*color, max(0, alpha - 60)), (cx, cy), max(1, int(size * 0.5)))
+            else:
+                pygame.draw.circle(surf, (*color, alpha), (cx, cy), int(size))
+            self.screen.blit(surf, (int(sx - size * 1.5), int(sy - size * 1.5)))
+
         for o in self.orbs:
             o.draw(self.screen, cam)
         for g in self.gas_pickups:
             g.draw(self.screen, cam)
+        for ev in self.evolution_pickups:
+            ev.draw(self.screen, cam)
+        for m in self.minions:
+            sx = int(m.get("x", self.player.x) - cam[0])
+            sy = int(m.get("y", self.player.y) - cam[1])
+            pygame.draw.circle(self.screen, (180, 255, 255), (sx, sy), 10)
+            pygame.draw.circle(self.screen, (60, 180, 220), (sx, sy), 6)
         for e in self.enemies:
             e.draw(self.screen, cam)
         for b in self.bullets:
@@ -1304,6 +1287,11 @@ class Game:
             sx = int(eb["x"] - cam[0])
             sy = int(eb["y"] - cam[1])
             pygame.draw.circle(self.screen, COLOR_RED, (sx, sy), eb["r"])
+        # laser beam visual
+        if self.player.laser_active and self.laser_segment:
+            px, py, ex, ey = self.laser_segment
+            pygame.draw.line(self.screen, (255, 180, 90), (int(px - cam[0]), int(py - cam[1])), (int(ex - cam[0]), int(ey - cam[1])), 10)
+            pygame.draw.line(self.screen, (255, 240, 200), (int(px - cam[0]), int(py - cam[1])), (int(ex - cam[0]), int(ey - cam[1])), 4)
         self.player.draw(self.screen)
         self._draw_death_fx(cam)
         self._draw_damage_texts(cam)
@@ -1321,6 +1309,14 @@ class Game:
             pygame.draw.rect(overlay, color, (self.w - i - 1, 0, 1, self.h))
         self.screen.blit(overlay, (0, 0))
 
+    def draw_vision_overlay(self):
+        alpha = int(180 * max(0.0, min(1.0, self.vision_dim)))
+        if alpha <= 0:
+            return
+        overlay = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        pygame.draw.rect(overlay, (0, 0, 0, alpha), (0, 0, self.w, self.h))
+        self.screen.blit(overlay, (0, 0))
+
     def _draw_death_fx(self, cam):
         for fx in self.death_fx:
             sx = int(fx["x"] - cam[0])
@@ -1333,7 +1329,8 @@ class Game:
             sx = int(txt["x"] - cam[0])
             sy = int(txt["y"] - cam[1])
             alpha = int(255 * (txt["life"] / 0.6))
-            surf = self.font_small.render(str(txt["val"]), True, COLOR_YELLOW)
+            color = txt.get("color", COLOR_YELLOW)
+            surf = self.font_small.render(str(txt["val"]), True, color)
             surf.set_alpha(alpha)
             self.screen.blit(surf, (sx, sy))
 
@@ -1379,6 +1376,33 @@ class Game:
             ammo_txt = self.font_small.render(f"AMMO {self.player.ammo}/{self.player.mag_size}", True, COLOR_WHITE)
         self.screen.blit(ammo_txt, (lvl_x, ammo_y))
 
+        laser_y = ammo_y + 22
+        if self.player.laser_active:
+            laser_txt = self.font_small.render("LASER ACTIVE", True, COLOR_GREEN)
+        elif self.player.laser_cooldown > 0:
+            laser_txt = self.font_small.render(f"LASER {int(self.player.laser_cooldown)}s", True, COLOR_WHITE)
+        else:
+            laser_txt = self.font_small.render("LASER READY", True, COLOR_GREEN)
+        self.screen.blit(laser_txt, (lvl_x, laser_y))
+
+        # boost meter bottom-right vertical bar
+        bar_h = 140
+        bar_w = 16
+        bar_x = self.w - 40
+        bar_y = self.h - 40 - bar_h
+        pygame.draw.rect(self.screen, COLOR_DARK_GRAY, (bar_x, bar_y, bar_w, bar_h))
+        ratio = self.player.boost_meter / max(1, self.player.boost_meter_max)
+        fill_h = int(bar_h * ratio)
+        pygame.draw.rect(self.screen, (120, 240, 255), (bar_x, bar_y + (bar_h - fill_h), bar_w, fill_h))
+        boost_color = (255, 160, 90) if self.player.boosting else COLOR_WHITE
+        letters = "BOOST"
+        lx = bar_x + bar_w + 6
+        ly = bar_y
+        for ch in letters:
+            surf = self.font_tiny.render(ch, True, boost_color)
+            self.screen.blit(surf, (lx, ly))
+            ly += surf.get_height() + 2
+
     def draw_levelup(self):
         overlay = pygame.Surface((self.w, self.h))
         overlay.set_alpha(200)
@@ -1410,6 +1434,32 @@ class Game:
                 t2,
                 (rect.centerx - t2.get_width() // 2, rect.y + rect.height // 2 + 4),
             )
+
+    def draw_evolution(self):
+        overlay = pygame.Surface((self.w, self.h))
+        overlay.set_alpha(220)
+        overlay.fill((12, 6, 24))
+        self.screen.blit(overlay, (0, 0))
+        title = self.font_large.render("EVOLUTION", True, COLOR_YELLOW)
+        self.screen.blit(title, (self.w // 2 - title.get_width() // 2, self.h // 4))
+        w = 320
+        h = 150
+        gap = 24
+        total_w = 3 * w + 2 * gap
+        start_x = WIDTH // 2 - total_w // 2
+        y = HEIGHT // 2 - h // 2
+        mouse_pos = pygame.mouse.get_pos()
+        for i, eid in enumerate(self.evolution_options):
+            rect = pygame.Rect(start_x + i * (w + gap), y, w, h)
+            is_hover = rect.collidepoint(mouse_pos)
+            col = COLOR_DARK_GRAY if not is_hover else COLOR_GRAY
+            pygame.draw.rect(self.screen, col, rect, border_radius=8)
+            name = evolution_name(eid)
+            desc = evolution_desc(eid)
+            t1 = self.font_small.render(name, True, COLOR_WHITE)
+            t2 = self.font_tiny.render(desc, True, COLOR_WHITE)
+            self.screen.blit(t1, (rect.centerx - t1.get_width() // 2, rect.y + rect.height // 2 - t1.get_height()))
+            self.screen.blit(t2, (rect.centerx - t2.get_width() // 2, rect.y + rect.height // 2 + 4))
 
     def draw_game_over(self):
         overlay = pygame.Surface((self.w, self.h))
@@ -1446,29 +1496,37 @@ class Game:
         overlay.fill((0, 0, 0))
         self.screen.blit(overlay, (0, 0))
         t = self.font_large.render("PAUSED", True, COLOR_WHITE)
-        title_y = self.h // 2 - t.get_height() - 40
+        title_y = self._layout_pause_sliders()
         self.screen.blit(t, (self.w // 2 - t.get_width() // 2, title_y))
-        # buttons under the label
-        self.btn_pause_resume.draw(self.screen)
-        self.btn_pause_reset.draw(self.screen)
-        self.btn_pause_quit.draw(self.screen)
-        # volume sliders in pause
+        # volume sliders in pause (immediately under label)
         label_music = self.font_small.render("MUSIC", True, COLOR_WHITE)
-        self.screen.blit(label_music, (self.pause_music_rect.x, self.pause_music_rect.y - 16))
+        # add breathing room above the slider so text isn't glued to the bar
+        self.screen.blit(label_music, (self.pause_music_rect.x, self.pause_music_rect.y - 28))
         pygame.draw.rect(self.screen, COLOR_DARK_GRAY, self.pause_music_rect)
         filled_m = int(self.pause_music_rect.width * self.music_volume)
         pygame.draw.rect(self.screen, COLOR_GREEN, (self.pause_music_rect.x, self.pause_music_rect.y, filled_m, self.pause_music_rect.height))
 
         label_sfx = self.font_small.render("SFX", True, COLOR_WHITE)
-        self.screen.blit(label_sfx, (self.pause_sfx_rect.x, self.pause_sfx_rect.y - 16))
+        self.screen.blit(label_sfx, (self.pause_sfx_rect.x, self.pause_sfx_rect.y - 28))
         pygame.draw.rect(self.screen, COLOR_DARK_GRAY, self.pause_sfx_rect)
         filled_s = int(self.pause_sfx_rect.width * self.sfx_volume)
         pygame.draw.rect(self.screen, COLOR_GREEN, (self.pause_sfx_rect.x, self.pause_sfx_rect.y, filled_s, self.pause_sfx_rect.height))
+        # buttons under sliders
+        self.btn_pause_resume.draw(self.screen)
+        self.btn_pause_reset.draw(self.screen)
+        self.btn_pause_quit.draw(self.screen)
 
     def _dropdown_rect(self):
         option_h = 34
         total_h = option_h * len(WINDOW_SIZES)
         return pygame.Rect(self.btn_window_dropdown.rect.x, self.btn_window_dropdown.rect.bottom + 6, self.btn_window_dropdown.rect.width, total_h)
+
+    def _dev_toggle_rect(self):
+        back = self.btn_settings_back.rect
+        w, h = 180, 32
+        x = back.centerx - w // 2
+        y = back.y - h - 12
+        return pygame.Rect(x, y, w, h)
 
     def draw_settings(self):
         cam = (0, 0)
@@ -1483,7 +1541,7 @@ class Game:
         label_bg = self.font_small.render("BG MUSIC", True, COLOR_WHITE)
         self.screen.blit(
             label_bg,
-            (self.slider_bg_rect.x, self.slider_bg_rect.y - 18),
+            (self.slider_bg_rect.x, self.slider_bg_rect.y - 30),
         )
         pygame.draw.rect(self.screen, COLOR_DARK_GRAY, self.slider_bg_rect)
         filled_w = int(self.slider_bg_rect.width * self.music_volume)
@@ -1497,7 +1555,7 @@ class Game:
         label_sfx = self.font_small.render("SFX", True, COLOR_WHITE)
         self.screen.blit(
             label_sfx,
-            (self.slider_sfx_rect.x, self.slider_sfx_rect.y - 18),
+            (self.slider_sfx_rect.x, self.slider_sfx_rect.y - 30),
         )
         pygame.draw.rect(self.screen, COLOR_DARK_GRAY, self.slider_sfx_rect)
         filled_w2 = int(self.slider_sfx_rect.width * self.sfx_volume)
@@ -1525,5 +1583,14 @@ class Game:
                 pygame.draw.rect(self.screen, col, r, border_radius=6)
                 txt = self.font_small.render(f"{w}x{h}", True, COLOR_WHITE)
                 self.screen.blit(txt, (r.x + 10, r.y + r.height // 2 - txt.get_height() // 2))
+
+        # dev toggle aligned with back button
+        dev_rect = self._dev_toggle_rect()
+        toggle_col = COLOR_GREEN if self.dev_mode else COLOR_DARK_GRAY
+        pygame.draw.rect(self.screen, toggle_col, dev_rect, border_radius=6)
+        toggle_txt = self.font_small.render("DEV MODE", True, COLOR_WHITE)
+        self.screen.blit(toggle_txt, (dev_rect.x + 12, dev_rect.y + 6))
+        status_txt = self.font_tiny.render("ON" if self.dev_mode else "OFF", True, COLOR_WHITE)
+        self.screen.blit(status_txt, (dev_rect.right - status_txt.get_width() - 10, dev_rect.y + 8))
 
         self.btn_settings_back.draw(self.screen)
