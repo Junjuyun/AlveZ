@@ -34,6 +34,7 @@ class Bullet:
         self.pierce_left = 0
         self.pierce_on_kill = False
         self.status = status or {}
+        self.target = None
 
     def update(self, dt):
         self.x += self.vx * dt * FPS
@@ -68,6 +69,8 @@ class Enemy:
         self.kind = kind
         self.boss_stage = boss_stage
         self.flash_timer = 0.0
+        self.hit_iframes = 0.0
+        self.aura_iframes = 0.0
         self.ice_timer = 0.0
         self.burn_timer = 0.0
         self.poison_timer = 0.0
@@ -81,6 +84,10 @@ class Enemy:
     def update(self, dt, player_pos):
         if self.flash_timer > 0:
             self.flash_timer -= dt
+        if self.hit_iframes > 0:
+            self.hit_iframes -= dt
+        if self.aura_iframes > 0:
+            self.aura_iframes -= dt
         if self.ice_timer > 0:
             self.ice_timer -= dt
         if self.burn_timer > 0:
@@ -148,7 +155,7 @@ class XPOrb:
         d = math.hypot(dx, dy) or 1
         magnet = getattr(player, "magnet_range", 160)
         if d < magnet:
-            speed = 6
+            speed = clamp(8 + (magnet - d) * 0.06, 10, 26)
             self.x += dx / d * speed * dt * FPS
             self.y += dy / d * speed * dt * FPS
 
@@ -259,9 +266,22 @@ class Player:
 
         self.pierce_mode = "none"
 
+        # smoothed movement direction for visuals
+        self.visual_dir = (0.0, -1.0)
+
         self.aura_radius = 0
         self.aura_dps = 0
         self.aura_unlocked = False
+        self.aura_tier = 0
+        self.aura_orb_radius = 110
+        self.aura_orb_damage = 18
+        self.aura_orb_speed = 1.6
+        self.aura_orb_size = 12
+        self.aura_orb_elements = []
+        self.aura_orb_count = 0
+        self.aura_orbs = []
+        self.aura_elemental = False
+        self.aura_orb_knockback = 38
 
         self.minion_count = 0
         self.minion_damage_mult = 1.0
@@ -337,6 +357,14 @@ class Player:
             effective_speed = self.speed * (self.boost_mult if self.boosting else 1.0)
             self.x += vx / l * effective_speed * dt * FPS
             self.y += vy / l * effective_speed * dt * FPS
+            # ease visual direction toward input for smoother rendering
+            lerp = min(1.0, dt * 8.0)
+            self.visual_dir = (
+                self.visual_dir[0] * (1 - lerp) + self.move_dir[0] * lerp,
+                self.visual_dir[1] * (1 - lerp) + self.move_dir[1] * lerp,
+            )
+            vl = math.hypot(*self.visual_dir) or 1.0
+            self.visual_dir = (self.visual_dir[0] / vl, self.visual_dir[1] / vl)
         half = WORLD_SIZE / 2
         self.x = clamp(self.x, -half, half)
         self.y = clamp(self.y, -half, half)
@@ -377,7 +405,8 @@ class Player:
                 b.pierce_on_kill = True
                 b.pierce_left = 1
             elif self.pierce_mode == "full":
-                b.pierce_left = 2
+                b.pierce_left = 999
+                b.infinite_pierce = True
             bullets.append(b)
 
         if self.back_shot:
@@ -393,7 +422,8 @@ class Player:
                     b.pierce_on_kill = True
                     b.pierce_left = 1
                 elif self.pierce_mode == "full":
-                    b.pierce_left = 2
+                    b.pierce_left = 999
+                    b.infinite_pierce = True
                 bullets.append(b)
         if self.ammo <= 0:
             self.reload_timer = self.reload_time
@@ -409,21 +439,67 @@ class Player:
         self.ammo = 0
         self.time_since_shot = 0.0
 
-    def draw(self, surf):
-        px = WIDTH // 2
-        py = HEIGHT // 2
+    def draw(self, surf, center=None):
+        if center is None:
+            px = WIDTH // 2
+            py = HEIGHT // 2
+        else:
+            px, py = center
         mx, my = pygame.mouse.get_pos()
         ang = math.atan2(my - py, mx - px)
         ca = math.cos(ang)
         sa = math.sin(ang)
+        mvx, mvy = self.visual_dir
+        ml = math.hypot(mvx, mvy) or 1.0
+        mvx, mvy = mvx / ml, mvy / ml
+        mc = mvx
+        ms = mvy
         r = self.radius
         if self.invuln > 0 and int(self.invuln * 15) % 2 == 0:
             return
         color = COLOR_WHITE if self.hit_flash > 0 else COLOR_PLAYER
-        p1 = (px + ca * r, py + sa * r)
-        p2 = (px - sa * r * 0.7, py + ca * r * 0.7)
-        p3 = (px + sa * r * 0.7, py - ca * r * 0.7)
-        pygame.draw.polygon(surf, color, [p1, p2, p3])
+        aim_side = (-sa, ca)
+        move_side = (-ms, mc)
+
+        # layer 1: movement-oriented butt triangle (smaller, no outline) and base circle
+        tip = (px + mc * r * 0.88, py + ms * r * 0.88)
+        base_left = (px - mc * r * 0.9 + move_side[0] * r * 0.95, py - ms * r * 0.9 + move_side[1] * r * 0.95)
+        base_right = (px - mc * r * 0.9 - move_side[0] * r * 0.95, py - ms * r * 0.9 - move_side[1] * r * 0.95)
+        pygame.draw.polygon(surf, (80, 120, 200), [tip, base_left, base_right])
+        pygame.draw.circle(surf, (40, 60, 90), (px, py), int(r * 1.02))
+
+        # layer 2: aim-oriented body and cannons (no cannon plate circle)
+        pygame.draw.circle(surf, color, (px, py), r)
+
+        def draw_barrels(count, direction, lateral_scale, color_main, color_trim):
+            if count <= 0:
+                return
+            if count == 1:
+                offsets = [0.0]
+            elif count == 2:
+                offsets = [-0.25, 0.25]
+            elif count == 3:
+                offsets = [-0.35, 0.0, 0.35]
+            else:
+                offsets = [-0.45, -0.15, 0.15, 0.45]
+            barrel_base = r * 0.92
+            barrel_len = r * 1.35
+            barrel_w = max(4, int(r * 0.2))
+            for off in offsets:
+                base_x = px + aim_side[0] * r * off * lateral_scale + direction[0] * barrel_base
+                base_y = py + aim_side[1] * r * off * lateral_scale + direction[1] * barrel_base
+                tip_x = base_x + direction[0] * barrel_len
+                tip_y = base_y + direction[1] * barrel_len
+                pygame.draw.line(surf, color_main, (base_x, base_y), (tip_x, tip_y), barrel_w)
+                pygame.draw.line(surf, color_trim, (base_x, base_y), (tip_x, tip_y), max(2, barrel_w // 2))
+
+        forward_count = min(4, self.bullet_count)
+        draw_barrels(forward_count, (ca, sa), 1.0, (230, 230, 240), (120, 200, 255))
+
+        if self.back_shot:
+            back_dir = (-ca, -sa)
+            back_count = 1 + (1 if self.back_extra else 0)
+            draw_barrels(back_count, back_dir, 0.7, (230, 210, 120), (255, 250, 200))
 
     def take_damage(self, hearts=1):
         if self.invuln > 0:
@@ -460,3 +536,14 @@ class Player:
         self.speed = self.base_speed * self.gas_speed_mult
         self.fire_rate = 5.0 * self.gas_fire_mult
         self.fire_cd = 1.0 / self.fire_rate
+
+    def rebuild_aura_orbs(self):
+        # evenly redistribute aura orb angles when the set changes
+        self.aura_orbs = []
+        if self.aura_orb_count <= 0:
+            return
+        elements = self.aura_orb_elements or ["shock"]
+        for i in range(self.aura_orb_count):
+            ang = math.tau * i / self.aura_orb_count
+            elem = elements[i % len(elements)]
+            self.aura_orbs.append({"angle": ang, "element": elem, "x": 0.0, "y": 0.0, "cd": 0.0})

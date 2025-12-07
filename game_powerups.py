@@ -22,7 +22,10 @@ POWERUPS = [
     "pierce_on_kill",
     "pierce_full",
     # extra effects
-    "aura",
+    "aura_1",
+    "aura_2",
+    "aura_3",
+    "aura_elements",
     "minion_1",
     "minion_2",
 ]
@@ -79,9 +82,15 @@ def available_powerups(player):
     elif player.pierce_tier < 2:
         opts.append("pierce_full")
 
-    # aura single unlock
-    if not getattr(player, "aura_unlocked", False):
-        opts.append("aura")
+    # aura progression
+    if player.aura_tier < 1:
+        opts.append("aura_1")
+    elif player.aura_tier < 2:
+        opts.append("aura_2")
+    elif player.aura_tier < 3:
+        opts.append("aura_3")
+    elif player.aura_unlocked and not getattr(player, "aura_elemental", False):
+        opts.append("aura_elements")
 
     # minion progression
     if player.minion_tier < 1:
@@ -154,10 +163,46 @@ def apply_powerup(player, pid: str):
         player.pierce_mode = "full"
         player.piercing = True
         player.pierce_tier = max(player.pierce_tier, 2)
-    elif pid == "aura":
-        player.aura_radius = max(player.aura_radius, 140)
-        player.aura_dps = max(player.aura_dps, 18)
+    elif pid == "aura_1":
         player.aura_unlocked = True
+        player.aura_tier = max(player.aura_tier, 1)
+        player.aura_orb_radius = 120
+        player.aura_orb_damage = 18
+        player.aura_orb_speed = 1.7
+        player.aura_orb_size = 12
+        player.aura_orb_elements = ["shock"]
+        player.aura_orb_count = max(player.aura_orb_count, 2)
+        if hasattr(player, "rebuild_aura_orbs"):
+            player.rebuild_aura_orbs()
+    elif pid == "aura_2":
+        player.aura_unlocked = True
+        player.aura_tier = max(player.aura_tier, 2)
+        player.aura_orb_radius = 130
+        player.aura_orb_damage = max(player.aura_orb_damage, 22)
+        player.aura_orb_speed = max(player.aura_orb_speed, 1.9)
+        player.aura_orb_size = 12
+        player.aura_orb_elements = ["shock", "fire"]
+        player.aura_orb_count = max(player.aura_orb_count, 4)
+        if hasattr(player, "rebuild_aura_orbs"):
+            player.rebuild_aura_orbs()
+    elif pid == "aura_3":
+        player.aura_unlocked = True
+        player.aura_tier = max(player.aura_tier, 3)
+        player.aura_orb_radius = 138
+        player.aura_orb_damage = max(player.aura_orb_damage, 28)
+        player.aura_orb_speed = max(player.aura_orb_speed, 2.2)
+        player.aura_orb_size = 13
+        player.aura_orb_elements = ["shock", "fire", "ice", "poison"]
+        player.aura_orb_count = max(player.aura_orb_count, 6)
+        if hasattr(player, "rebuild_aura_orbs"):
+            player.rebuild_aura_orbs()
+    elif pid == "aura_elements":
+        player.aura_unlocked = True
+        player.aura_elemental = True
+        player.aura_orb_elements = ["fire", "ice", "poison"]
+        player.aura_orb_damage = max(player.aura_orb_damage, 32)
+        if hasattr(player, "rebuild_aura_orbs"):
+            player.rebuild_aura_orbs()
     elif pid == "minion_1":
         player.minion_count = max(player.minion_count, 1)
         player.minion_tier = max(player.minion_tier, 1)
@@ -176,8 +221,13 @@ def apply_evolution(player, eid: str):
     elif eid == "guided_shots":
         player.guided_shots = True
     elif eid == "aura_overload":
-        player.aura_radius += 60
-        player.aura_dps *= 1.5
+        player.aura_orb_radius += 16
+        player.aura_orb_damage *= 1.25
+        player.aura_orb_speed += 0.5
+        player.aura_orb_size = max(player.aura_orb_size, 14)
+        player.aura_orb_count = max(player.aura_orb_count, (player.aura_tier or 1) + 1)
+        if hasattr(player, "rebuild_aura_orbs"):
+            player.rebuild_aura_orbs()
     elif eid == "minion_legion":
         player.minion_count += 2
         player.minion_damage_mult *= 1.35
@@ -204,7 +254,10 @@ def powerup_name(pid: str) -> str:
         "revive": "Revive Core",
         "pierce_on_kill": "Pierce (On Kill)",
         "pierce_full": "Pierce (Always)",
-        "aura": "Static Field",
+        "aura_1": "Static Field I",
+        "aura_2": "Static Field II",
+        "aura_3": "Static Field III",
+        "aura_elements": "Elemental Field",
         "minion_1": "Drone Buddy",
         "minion_2": "Drone Wing",
     }
@@ -228,7 +281,10 @@ def powerup_desc(pid: str) -> str:
         "revive": "+1 revive charge",
         "pierce_on_kill": "Bullets pass through kills",
         "pierce_full": "Bullets pierce regardless",
-        "aura": "Shock aura hurts nearby",
+        "aura_1": "2 shock orbs orbit",
+        "aura_2": "4 orbs, adds fire",
+        "aura_3": "6 orbs, mixed",
+        "aura_elements": "Orbs become fire/ice/poison",
         "minion_1": "Gain 1 drone",
         "minion_2": "Gain 3 drones",
     }
