@@ -8,6 +8,8 @@ from game_constants import *
 from game_entities import Bullet, Enemy, XPOrb, GasPickup, EvolutionPickup, Player
 from game_powerups import POWERUPS, EVOLUTIONS, apply_powerup, apply_evolution, powerup_name, powerup_desc, evolution_name, evolution_desc, available_powerups
 from game_ui import Button
+from upgrade_system import UpgradeManager
+from upgrade_trees import UPGRADES_BY_ID, ALL_TREES, get_tier3_upgrades, get_all_effects_for_tier3
 
 
 # --- main game ---
@@ -16,7 +18,7 @@ class Game:
         pygame.init()
         self.w, self.h = WIDTH, HEIGHT
         self.screen = pygame.display.set_mode((self.w, self.h))
-        pygame.display.set_caption("Starlight Eclipse")
+        pygame.display.set_caption("Space Invaders")
         self.clock = pygame.time.Clock()
 
         # pixel font (bundled)
@@ -26,11 +28,13 @@ class Game:
             self.font_medium = pygame.font.Font(font_path, 30)
             self.font_small = pygame.font.Font(font_path, 20)
             self.font_tiny = pygame.font.Font(font_path, 16)
+            self.font_micro = pygame.font.Font(font_path, 12)  # Smaller font for descriptions
         else:
             self.font_large = pygame.font.SysFont("PressStart2P", 64)
             self.font_medium = pygame.font.SysFont("PressStart2P", 30)
             self.font_small = pygame.font.SysFont("PressStart2P", 20)
             self.font_tiny = pygame.font.SysFont("PressStart2P", 16)
+            self.font_micro = pygame.font.SysFont("PressStart2P", 12)
 
         self.state = STATE_MENU
 
@@ -135,7 +139,8 @@ class Game:
         ]
         self.star_flashes = []
 
-        self.levelup_options = []
+        self.levelup_options = []  # List of upgrade IDs for level-up screen
+        self.upgrade_manager = None  # Initialized in reset_game
 
         # audio volumes (used by external audio module)
         self.music_volume = 0.5
@@ -164,9 +169,9 @@ class Game:
         self.window_size_index = 0
         self.show_size_dropdown = False
 
-        # dev mode controls
-        self.dev_mode = False
-        self.dev_power_queue = []
+        # test mode controls (renamed from dev mode)
+        self.test_mode = False
+        self.test_power_queue = []
 
         btn_y = self.h // 4 + 80
         self.btn_window_dropdown = Button(
@@ -220,6 +225,8 @@ class Game:
 
     def reset_game(self):
         self.player = Player(0, 0)
+        self.upgrade_manager = UpgradeManager(self.player)
+        self.player.upgrade_manager = self.upgrade_manager  # Reference for combat checks
         self.bullets = []
         self.enemies = []
         self.orbs = []
@@ -249,15 +256,32 @@ class Game:
         self.evolution_options = []
         self.bosses_spawned = 0
         self.vision_dim = 0.22
-        self.view_zoom = 1.0
+        self.view_zoom = 0.9  # Slightly zoomed out base view
+        
+        # New summon systems from upgrade trees
+        self.ghosts = []  # Free-moving, touch damage
+        self.drones = []  # Orbiting, shooting
+        self.dragon = None
+        self.magic_lenses = []
+        self.magic_shields = []  # Orbiting shields
+        self.magic_scythes = []
+        self.magic_spears = []
+        self.phantoms = []
+        self.gale_active = False
+        self.gale_timer = 0.0
+        self.lightning_fx = []
+        self.fireball_fx = []
+        self.glare_flash_timer = 0.0
 
-        if self.dev_mode:
-            self.player.level = 40
+        if self.test_mode:
+            self.player.level = 1
             self.player.xp = 0
             self.player.xp_to_level = XP_PER_LEVEL
-            self.dev_power_queue = list(POWERUPS)
+            # In test mode, provide only Tier 3 upgrades
+            tier3_list = get_tier3_upgrades()
+            self.test_power_queue = [u.id for u in tier3_list]
         else:
-            self.dev_power_queue.clear()
+            self.test_power_queue.clear()
 
     def run(self):
         running = True
@@ -333,7 +357,7 @@ class Game:
             if self.btn_start.is_clicked(e):
                 audio.play_sfx(audio.snd_menu_click)
                 self.reset_game()
-                if self.dev_mode:
+                if self.test_mode:
                     self.roll_levelup()
                 else:
                     self.state = STATE_PLAYING
@@ -347,7 +371,7 @@ class Game:
             if self.btn_restart.is_clicked(e):
                 audio.play_sfx(audio.snd_menu_click)
                 self.reset_game()
-                if self.dev_mode:
+                if self.test_mode:
                     self.roll_levelup()
                 else:
                     self.state = STATE_PLAYING
@@ -357,17 +381,26 @@ class Game:
         elif self.state == STATE_LEVEL_UP:
             if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 mx, my = e.pos
-                w = 260
-                h = 120
-                gap = 20
+                w = 320
+                h = 180
+                gap = 24
                 total_w = 3 * w + 2 * gap
                 start_x = WIDTH // 2 - total_w // 2
                 y = HEIGHT // 2 - h // 2
-                for i, pid in enumerate(self.levelup_options):
+                
+                # Check skip button first (test mode only)
+                if self.test_mode:
+                    skip_rect = pygame.Rect(WIDTH // 2 - 80, y + h + 30, 160, 40)
+                    if skip_rect.collidepoint(mx, my):
+                        audio.play_sfx(audio.snd_menu_click)
+                        self.state = STATE_PLAYING
+                        return
+                
+                for i, uid in enumerate(self.levelup_options):
                     rect = pygame.Rect(start_x + i * (w + gap), y, w, h)
                     if rect.collidepoint(mx, my):
-                        apply_powerup(self.player, pid)
-                        if self.dev_mode and self.dev_power_queue:
+                        self.apply_levelup_choice(uid)
+                        if self.test_mode and self.test_power_queue:
                             self.roll_levelup()
                         else:
                             self.state = STATE_PLAYING
@@ -375,9 +408,9 @@ class Game:
         elif self.state == STATE_EVOLUTION:
             if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 mx, my = e.pos
-                w = 260
-                h = 120
-                gap = 20
+                w = 320
+                h = 180
+                gap = 24
                 total_w = 3 * w + 2 * gap
                 start_x = WIDTH // 2 - total_w // 2
                 y = HEIGHT // 2 - h // 2
@@ -430,15 +463,16 @@ class Game:
                     else:
                         self.show_size_dropdown = False
 
-                # dev toggle
-                dev_rect = self._dev_toggle_rect()
-                if dev_rect.collidepoint(mx, my):
+                # test mode toggle
+                test_rect = self._test_toggle_rect()
+                if test_rect.collidepoint(mx, my):
                     audio.play_sfx(audio.snd_menu_click)
-                    self.dev_mode = not self.dev_mode
-                    if self.dev_mode:
-                        self.dev_power_queue = list(POWERUPS)
+                    self.test_mode = not self.test_mode
+                    if self.test_mode:
+                        # In test mode, provide ALL upgrades from new tree system
+                        self.test_power_queue = list(UPGRADES_BY_ID.keys())
                     else:
-                        self.dev_power_queue.clear()
+                        self.test_power_queue.clear()
         elif self.state == STATE_PLAYING:
             if e.type == pygame.KEYDOWN and e.key == pygame.K_r:
                 self.player.start_reload()
@@ -453,7 +487,7 @@ class Game:
             elif self.btn_pause_reset.is_clicked(e):
                 self.reset_game()
                 audio.play_sfx(audio.snd_unpause)
-                if self.dev_mode:
+                if self.test_mode:
                     self.roll_levelup()
                 else:
                     self.state = STATE_PLAYING
@@ -568,6 +602,10 @@ class Game:
         self.elapsed_time += dt
         keys = pygame.key.get_pressed()
         self.player.update(dt, keys)
+        
+        # Update upgrade manager for timed effects
+        is_moving = keys[pygame.K_w] or keys[pygame.K_s] or keys[pygame.K_a] or keys[pygame.K_d]
+        self.upgrade_manager.update(dt, is_moving=is_moving, is_stationary=not is_moving)
 
         # manage laser ultimate timers
         if self.player.laser_cooldown > 0:
@@ -583,9 +621,9 @@ class Game:
             self.laser_segment = None
 
         # smooth zooming while boosting so the world shrinks slightly
-        target_zoom = 0.82 if self.player.boosting else 1.0
+        target_zoom = 0.75 if self.player.boosting else 0.9
         self.view_zoom += (target_zoom - self.view_zoom) * min(1.0, dt * 6.0)
-        self.view_zoom = clamp(self.view_zoom, 0.7, 1.1)
+        self.view_zoom = clamp(self.view_zoom, 0.65, 1.05)
 
         view_half_w = (self.w / max(0.1, self.view_zoom)) * 0.5
         view_half_h = (self.h / max(0.1, self.view_zoom)) * 0.5
@@ -654,14 +692,38 @@ class Game:
 
         self._update_minions(dt)
         self._update_aura_orbs(dt)
+        self._update_summons(dt)
 
         # shooting
         if pygame.mouse.get_pressed()[0] and self.player.can_shoot():
             mx, my = pygame.mouse.get_pos()
-            world_target = (cam[0] + mx, cam[1] + my)
-            new_bullets = self.player.shoot(world_target)
+            # Adjust mouse position for zoom - screen center is player position
+            center_x, center_y = self.w / 2, self.h / 2
+            # Mouse offset from center, scaled by zoom
+            offset_x = (mx - center_x) / self.view_zoom
+            offset_y = (my - center_y) / self.view_zoom
+            world_target = (self.player.x + offset_x, self.player.y + offset_y)
+            
+            # Check siege ammo save
+            is_stationary = not (keys[pygame.K_w] or keys[pygame.K_s] or keys[pygame.K_a] or keys[pygame.K_d])
+            if not self.upgrade_manager.check_siege_ammo_save(is_stationary):
+                new_bullets = self.player.shoot(world_target)
+            else:
+                # Siege saved the ammo - still fire but don't consume
+                new_bullets = self.player.shoot(world_target)
+                self.player.ammo = min(self.player.mag_size, self.player.ammo + 1)
+            
             self.bullets.extend(new_bullets)
             audio.play_sfx(audio.snd_shoot)
+            
+            # Trigger on_shot effects (lightning, fireball)
+            shot_effects = self.upgrade_manager.on_shot()
+            self._handle_shot_effects(shot_effects, world_target)
+            
+            # Check for empty mag effects
+            if self.player.ammo <= 0:
+                empty_effects = self.upgrade_manager.on_empty_mag()
+                self._handle_empty_mag_effects(empty_effects)
 
         if self.player.guided_shots and self.enemies:
             for b in self.bullets:
@@ -702,10 +764,18 @@ class Game:
 
         for b in self.bullets:
             b.update(dt)
-        self.bullets = [b for b in self.bullets if not b.offscreen(cam)]
+            # Initialize bounce properties if needed
+            bounce_count = getattr(self.player, "bounce_count", 0)
+            if bounce_count > 0 and getattr(b, "bounces_left", None) is None:
+                b.bounces_left = bounce_count
+                b.bounced_enemies = set()  # Track which enemies we bounced off
+        self.bullets = [b for b in self.bullets if not b.offscreen(cam) or getattr(b, "bounces_left", 0) > 0]
 
         if self.boost_effect_timer > 0:
             self.boost_effect_timer = max(0.0, self.boost_effect_timer - dt)
+        
+        if self.glare_flash_timer > 0:
+            self.glare_flash_timer = max(0.0, self.glare_flash_timer - dt)
 
         # damage texts
         for txt in list(self.damage_texts):
@@ -812,9 +882,17 @@ class Game:
         # DoT deaths
         for en in list(self.enemies):
             if en.hp <= 0:
+                was_cursed = getattr(en, "curse_timer", 0) > 0
+                was_frozen = getattr(en, "ice_timer", 0) > 0
                 self.kills += 1
                 self.player.kills += 1
+                self.upgrade_manager.on_kill(enemy_was_cursed=was_cursed, enemy_was_frozen=was_frozen)
                 self.orbs.append(XPOrb(en.x, en.y, XP_PER_ORB))
+                
+                # Splinter on kill
+                if self.player.splinter_on_kill:
+                    self._spawn_splinter_bullets(en.x, en.y)
+                
                 if random.random() < 0.05:
                     self.gas_pickups.append(GasPickup(en.x, en.y))
                 if self.player.burn_chain:
@@ -843,13 +921,52 @@ class Game:
                     dx = self.player.x - en.x
                     dy = self.player.y - en.y
                     l = math.hypot(dx, dy) or 1
-                    speed = 5.0 if en.kind != "boss" else 12.0
-                    self.enemy_bullets.append({"x": en.x, "y": en.y, "vx": dx / l * speed, "vy": dy / l * speed, "r": 6 if en.kind == "boss" else 4, "dmg": 1})
+                    speed = 3.0 if en.kind != "boss" else 8.0  # Slower bullets
+                    self.enemy_bullets.append({"x": en.x, "y": en.y, "vx": dx / l * speed, "vy": dy / l * speed, "r": 10 if en.kind == "boss" else 8, "dmg": 1})  # Bigger bullets
+
+        # Summoner enemies spawn minions
+        for en in self.enemies:
+            base_kind = getattr(en, "kind", "").replace("elite_", "")
+            if base_kind == "summoner":
+                if not hasattr(en, "summon_cd"):
+                    en.summon_cd = random.uniform(3.0, 5.0)
+                en.summon_cd -= dt
+                if en.summon_cd <= 0:
+                    en.summon_cd = random.uniform(3.0, 5.0)
+                    # Spawn 2-3 minions around this enemy
+                    minion_count = random.randint(2, 3)
+                    for _ in range(minion_count):
+                        ang = random.uniform(0, math.tau)
+                        mx = en.x + math.cos(ang) * 40
+                        my = en.y + math.sin(ang) * 40
+                        self.spawning_manager.spawn_minion(mx, my)
 
         # enemy bullets update/collisions
         for eb in list(self.enemy_bullets):
             eb["x"] += eb["vx"] * dt * FPS
             eb["y"] += eb["vy"] * dt * FPS
+            
+            # Check orbiting shield blocking
+            blocked = False
+            for shield in self.magic_shields:
+                shield_x = shield.get("x", self.player.x)
+                shield_y = shield.get("y", self.player.y)
+                dist = math.hypot(eb["x"] - shield_x, eb["y"] - shield_y)
+                
+                if dist < 25:  # Shield hit radius
+                    # Shield blocks the bullet
+                    blocked = True
+                    if eb in self.enemy_bullets:
+                        self.enemy_bullets.remove(eb)
+                    # Reflect if player has reflect upgrade
+                    if getattr(self.player, "shield_reflect", False):
+                        # Reflect bullet back
+                        eb["vx"] = -eb["vx"] * 1.5
+                        eb["vy"] = -eb["vy"] * 1.5
+                    break
+            if blocked:
+                continue
+            
             if circle_collision(self.player.x, self.player.y, self.player.radius, eb["x"], eb["y"], eb["r"]):
                 if self.player.invuln <= 0:
                     self.player.take_damage(1)
@@ -913,31 +1030,80 @@ class Game:
                         en.poison_timer = max(en.poison_timer, 5.0)
                         en.poison_dps = max(en.poison_dps, self.player.damage * 0.22 * self.player.poison_bonus_mult)
                         self._spawn_status_fx(en.x, en.y, kind="poison")
+                    
+                    # Execute check - auto-kill low HP enemies
+                    if en.hp > 0 and hasattr(en, "max_hp") and en.max_hp > 0:
+                        hp_ratio = en.hp / en.max_hp
+                        if self.upgrade_manager.check_execute(hp_ratio):
+                            en.hp = 0
+                            self.damage_texts.append({"x": en.x, "y": en.y - 20, "val": "EXECUTE", "life": 0.6, "color": (255, 50, 50)})
+                    
                     killed = en.hp <= 0
-
-                    if b.piercing:
-                        if b.pierce_on_kill:
-                            if killed:
-                                b.pierce_left -= 1
-                                if b.pierce_left < 0 and b in self.bullets:
-                                    self.bullets.remove(b)
+                    
+                    # Bullet bouncing off enemies
+                    bounces_left = getattr(b, "bounces_left", 0)
+                    bounced_enemies = getattr(b, "bounced_enemies", set())
+                    
+                    should_remove_bullet = True
+                    if bounces_left > 0 and id(en) not in bounced_enemies:
+                        # Bounce to next enemy
+                        bounced_enemies.add(id(en))
+                        b.bounced_enemies = bounced_enemies
+                        b.bounces_left -= 1
+                        
+                        # Apply bounce damage bonus
+                        bonus = getattr(self.player, "bounce_damage_bonus", 0)
+                        if bonus > 0:
+                            b.damage = int(b.damage * (1 + bonus))
+                        
+                        # Find next target to bounce to
+                        other_enemies = [e for e in self.enemies if id(e) not in bounced_enemies and e.hp > 0]
+                        if other_enemies:
+                            # Bounce homing - seek nearest enemy
+                            if getattr(self.player, "bounce_homing", False):
+                                closest = min(other_enemies, key=lambda e: (e.x - b.x) ** 2 + (e.y - b.y) ** 2)
                             else:
-                                if b in self.bullets:
-                                    self.bullets.remove(b)
+                                closest = random.choice(other_enemies)
+                            ddx = closest.x - b.x
+                            ddy = closest.y - b.y
+                            dist = max(1, math.hypot(ddx, ddy))
+                            speed = math.hypot(b.vx, b.vy)
+                            b.vx = (ddx / dist) * speed
+                            b.vy = (ddy / dist) * speed
+                            should_remove_bullet = False
+                    
+                    if should_remove_bullet:
+                        if b.piercing:
+                            if b.pierce_on_kill:
+                                if killed:
+                                    b.pierce_left -= 1
+                                    if b.pierce_left < 0 and b in self.bullets:
+                                        self.bullets.remove(b)
+                                else:
+                                    if b in self.bullets:
+                                        self.bullets.remove(b)
+                            else:
+                                if b.pierce_left > 0:
+                                    b.pierce_left -= 1
+                                else:
+                                    if b in self.bullets:
+                                        self.bullets.remove(b)
                         else:
-                            if b.pierce_left > 0:
-                                b.pierce_left -= 1
-                            else:
-                                if b in self.bullets:
-                                    self.bullets.remove(b)
-                    else:
-                        if b in self.bullets:
-                            self.bullets.remove(b)
+                            if b in self.bullets:
+                                self.bullets.remove(b)
 
                     if en.hp <= 0:
+                        was_cursed = getattr(en, "curse_timer", 0) > 0
+                        was_frozen = getattr(en, "ice_timer", 0) > 0
                         self.kills += 1
                         self.player.kills += 1
+                        self.upgrade_manager.on_kill(enemy_was_cursed=was_cursed, enemy_was_frozen=was_frozen)
                         self.orbs.append(XPOrb(en.x, en.y, XP_PER_ORB))
+                        
+                        # Splinter on kill - spawn bullets from dead enemy
+                        if self.player.splinter_on_kill:
+                            self._spawn_splinter_bullets(en.x, en.y)
+                        
                         # chance to drop gas
                         if random.random() < 0.05:
                             self.gas_pickups.append(GasPickup(en.x, en.y))
@@ -962,7 +1128,13 @@ class Game:
         for en in list(self.enemies):
             if circle_collision(self.player.x, self.player.y, self.player.radius, en.x, en.y, en.radius):
                 if self.player.invuln <= 0:
+                    # Check dodge
+                    if self.upgrade_manager.check_dodge():
+                        # Dodged! Add visual feedback
+                        self.damage_texts.append({"x": self.player.x, "y": self.player.y - 20, "val": "DODGE", "life": 0.5, "color": (100, 200, 255)})
+                        continue
                     self.player.take_damage(1)
+                    self.upgrade_manager.on_hit()
                     audio.play_sfx(audio.snd_player_hit)
                     # knockback both
                     dx = self.player.x - en.x
@@ -986,6 +1158,7 @@ class Game:
             if circle_collision(self.player.x, self.player.y, self.player.radius, o.x, o.y, o.radius):
                 leveled = self.player.add_xp(o.xp)
                 self.orbs.remove(o)
+                self.upgrade_manager.on_xp_pickup()
                 if leveled:
                     # level-up gating
                     if self.player.level_ups_since_reward == POWERUP_FIRST or self.player.level_ups_since_reward >= POWERUP_INTERVAL:
@@ -1261,6 +1434,764 @@ class Game:
                     orb["cd"] = 0.2
                     break
 
+    def _update_summons(self, dt):
+        """Update all summon systems: ghosts, dragon, magic weapons, gale, glare."""
+        self._update_ghosts(dt)
+        self._update_dragon(dt)
+        self._update_magic_lenses(dt)
+        self._update_magic_shields(dt)
+        self._update_magic_scythes(dt)
+        self._update_magic_spears(dt)
+        self._update_gale(dt)
+        self._update_glare(dt)
+        self._update_lightning_fx(dt)
+        self._update_fireball_fx(dt)
+
+    def _update_ghosts(self, dt):
+        """Update all ghost/drone/phantom systems."""
+        self._update_free_ghosts(dt)  # Free-moving, touch damage
+        self._update_orbit_drones(dt)  # Orbiting, shooting
+        self._update_phantoms(dt)
+    
+    def _update_free_ghosts(self, dt):
+        """Update ghost summons - chase and damage enemies on touch."""
+        target_count = getattr(self.player, "ghost_count", 0)
+        
+        # Add ghosts with proper tracking data
+        while len(self.ghosts) < target_count:
+            self.ghosts.append({
+                "x": self.player.x,
+                "y": self.player.y,
+                "vx": 0,
+                "vy": 0,
+                "target": None,
+                "hit_cooldowns": {}  # Per-enemy cooldowns: {enemy_id: cooldown_time}
+            })
+        # Remove extra ghosts
+        if len(self.ghosts) > target_count:
+            self.ghosts = self.ghosts[:target_count]
+        
+        if not self.ghosts:
+            return
+        
+        # Ghost stats
+        ghost_speed = 200  # 2x enemy base speed (100), very fast
+        vision_range = 400  # Full screen vision
+        touch_radius = 20  # Collision radius
+        hit_cooldown = 1.0  # 1 second cooldown per enemy
+        
+        base_dmg = getattr(self.player, "drone_damage", 0)
+        if base_dmg <= 0:
+            base_dmg = getattr(self.player, "ghost_damage", 0)
+        if base_dmg <= 0:
+            base_dmg = int(self.player.damage * 0.4)
+        ghost_damage = int(base_dmg * getattr(self.player, "summon_damage_mult", 1.0))
+        ghost_burn = getattr(self.player, "drone_burn", False) or getattr(self.player, "ghost_burn", False)
+        ghost_poison = getattr(self.player, "drone_poison", False)
+        
+        for g in self.ghosts:
+            # Update per-enemy cooldowns
+            cooldowns = g.get("hit_cooldowns", {})
+            for eid in list(cooldowns.keys()):
+                cooldowns[eid] -= dt
+                if cooldowns[eid] <= 0:
+                    del cooldowns[eid]
+            g["hit_cooldowns"] = cooldowns
+            
+            # Find closest enemy in vision range that's not on cooldown
+            available_enemies = [
+                e for e in self.enemies 
+                if math.hypot(e.x - self.player.x, e.y - self.player.y) < vision_range
+                and id(e) not in cooldowns
+                and e.hp > 0
+            ]
+            
+            target = None
+            if available_enemies:
+                target = min(available_enemies, key=lambda e: (e.x - g["x"]) ** 2 + (e.y - g["y"]) ** 2)
+            
+            # Movement - fluid chase or return to player
+            if target:
+                # Chase target smoothly
+                dx = target.x - g["x"]
+                dy = target.y - g["y"]
+                dist = max(1, math.hypot(dx, dy))
+                
+                # Smooth acceleration toward target
+                target_vx = (dx / dist) * ghost_speed
+                target_vy = (dy / dist) * ghost_speed
+                lerp = min(1.0, dt * 8.0)  # Smooth interpolation
+                g["vx"] = g.get("vx", 0) * (1 - lerp) + target_vx * lerp
+                g["vy"] = g.get("vy", 0) * (1 - lerp) + target_vy * lerp
+                
+                # Check collision with target
+                if dist < touch_radius + target.radius:
+                    # Damage enemy
+                    target.hp -= ghost_damage
+                    target.flash_timer = 0.15
+                    self.damage_texts.append({"x": target.x, "y": target.y - 10, "val": int(ghost_damage), "life": 0.5, "color": (180, 220, 255)})
+                    
+                    # Apply status effects
+                    if ghost_burn:
+                        target.burn_timer = max(target.burn_timer, 2.0)
+                        target.burn_dps = max(target.burn_dps, ghost_damage * 0.2)
+                    if ghost_poison:
+                        target.poison_timer = max(target.poison_timer, 3.0)
+                        target.poison_dps = max(target.poison_dps, ghost_damage * 0.15)
+                    
+                    # Set cooldown for this enemy
+                    g["hit_cooldowns"][id(target)] = hit_cooldown
+            else:
+                # No target - orbit around player
+                dist_to_player = math.hypot(g["x"] - self.player.x, g["y"] - self.player.y)
+                if dist_to_player > 60:
+                    # Return to player
+                    dx = self.player.x - g["x"]
+                    dy = self.player.y - g["y"]
+                    dist = max(1, math.hypot(dx, dy))
+                    target_vx = (dx / dist) * ghost_speed * 0.5
+                    target_vy = (dy / dist) * ghost_speed * 0.5
+                    lerp = min(1.0, dt * 5.0)
+                    g["vx"] = g.get("vx", 0) * (1 - lerp) + target_vx * lerp
+                    g["vy"] = g.get("vy", 0) * (1 - lerp) + target_vy * lerp
+                else:
+                    # Near player - slow orbit
+                    g["vx"] *= 0.9
+                    g["vy"] *= 0.9
+            
+            # Apply movement
+            g["x"] += g.get("vx", 0) * dt
+            g["y"] += g.get("vy", 0) * dt
+    
+    def _update_phantoms(self, dt):
+        """Update phantom summons - actively seek enemies while following player like dragon."""
+        if not hasattr(self, "phantoms"):
+            self.phantoms = []
+        
+        target_count = getattr(self.player, "phantom_count", 0)
+        
+        # Add phantoms
+        while len(self.phantoms) < target_count:
+            self.phantoms.append({
+                "x": self.player.x + random.uniform(-50, 50),
+                "y": self.player.y + random.uniform(-50, 50),
+                "vx": 0,
+                "vy": 0,
+                "cd": 0,
+                "max_dist": 700,  # Max distance from player before returning
+                "chase_dist": 350  # Get very close to enemies to attack
+            })
+        if len(self.phantoms) > target_count:
+            self.phantoms = self.phantoms[:target_count]
+        
+        if not self.phantoms:
+            return
+        
+        phantom_speed = 200 * getattr(self.player, "phantom_speed", 1.0)
+        phantom_damage = getattr(self.player, "phantom_damage", 15) * getattr(self.player, "summon_damage_mult", 1.0)
+        phantom_slow = getattr(self.player, "phantom_slow", False)
+        phantom_lifesteal = getattr(self.player, "phantom_lifesteal", False)
+        vision_range = 400  # How far phantom can see enemies
+        
+        for p in self.phantoms:
+            p["cd"] -= dt
+            
+            # Check distance to player
+            dist_to_player = math.hypot(p["x"] - self.player.x, p["y"] - self.player.y)
+            
+            # Find enemy in vision range closest to phantom (active seeking)
+            target_enemy = None
+            dist_to_enemy = 9999
+            if self.enemies:
+                visible = [e for e in self.enemies if math.hypot(e.x - p["x"], e.y - p["y"]) < vision_range]
+                if visible:
+                    target_enemy = min(visible, key=lambda en: (en.x - p["x"]) ** 2 + (en.y - p["y"]) ** 2)
+                    dist_to_enemy = math.hypot(target_enemy.x - p["x"], target_enemy.y - p["y"])
+            
+            # Decide movement - prioritize chasing enemies while staying tethered to player
+            if dist_to_player > p["max_dist"]:
+                # Too far from player - return urgently
+                dx = self.player.x - p["x"]
+                dy = self.player.y - p["y"]
+                dist = max(1, math.hypot(dx, dy))
+                p["vx"] = (dx / dist) * phantom_speed
+                p["vy"] = (dy / dist) * phantom_speed
+            elif target_enemy:
+                # Actively chase enemy
+                dx = target_enemy.x - p["x"]
+                dy = target_enemy.y - p["y"]
+                dist = max(1, math.hypot(dx, dy))
+                chase_speed = phantom_speed if dist_to_player < p["max_dist"] - 80 else phantom_speed * 0.5
+                p["vx"] = (dx / dist) * chase_speed
+                p["vy"] = (dy / dist) * chase_speed
+            else:
+                # No enemy - float near player
+                if dist_to_player > 60:
+                    dx = self.player.x - p["x"]
+                    dy = self.player.y - p["y"]
+                    dist = max(1, math.hypot(dx, dy))
+                    p["vx"] = (dx / dist) * phantom_speed * 0.3
+                    p["vy"] = (dy / dist) * phantom_speed * 0.3
+                else:
+                    p["vx"] *= 0.9
+                    p["vy"] *= 0.9
+            
+            # Apply movement
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            
+            # Attack when close to enemy (touch damage)
+            if p["cd"] <= 0 and target_enemy and dist_to_enemy < target_enemy.radius + 20:
+                target_enemy.hp -= phantom_damage
+                target_enemy.flash_timer = 0.15
+                self.damage_texts.append({"x": target_enemy.x, "y": target_enemy.y - 10, "val": int(phantom_damage), "life": 0.5, "color": (200, 200, 255)})
+                
+                if phantom_slow:
+                    target_enemy.ice_timer = max(target_enemy.ice_timer, 1.5)
+                if phantom_lifesteal:
+                    self.player.hearts = min(self.player.max_hearts, self.player.hearts + 1)
+                
+                p["cd"] = 0.8  # Attack cooldown
+        
+        # Phantom-to-phantom collision (push apart)
+        phantom_radius = 15
+        for i, p1 in enumerate(self.phantoms):
+            for p2 in self.phantoms[i+1:]:
+                dx = p2["x"] - p1["x"]
+                dy = p2["y"] - p1["y"]
+                dist = math.hypot(dx, dy)
+                min_dist = phantom_radius * 2
+                if dist < min_dist and dist > 0:
+                    overlap = (min_dist - dist) / 2
+                    nx, ny = dx / dist, dy / dist
+                    p1["x"] -= nx * overlap
+                    p1["y"] -= ny * overlap
+                    p2["x"] += nx * overlap
+                    p2["y"] += ny * overlap
+
+    def _update_orbit_drones(self, dt):
+        """Update orbiting drone summons - circle around player and shoot enemies."""
+        target_count = getattr(self.player, "drone_count", 0)
+        
+        # Add drones with proper spacing
+        while len(self.drones) < target_count:
+            index = len(self.drones)
+            base_angle = index * (math.tau / max(1, target_count))
+            self.drones.append({
+                "index": index,
+                "angle": base_angle,
+                "cd": random.uniform(0.3, 0.8),
+                "x": self.player.x,
+                "y": self.player.y
+            })
+        # Remove extra drones
+        if len(self.drones) > target_count:
+            self.drones = self.drones[:target_count]
+        
+        if not self.drones:
+            return
+        
+        # Redistribute angles to keep even spacing
+        for i, d in enumerate(self.drones):
+            d["index"] = i
+        
+        # Find target
+        target = None
+        if self.enemies:
+            visible_enemies = [e for e in self.enemies if math.hypot(e.x - self.player.x, e.y - self.player.y) < 400]
+            if visible_enemies:
+                target = min(visible_enemies, key=lambda en: (en.x - self.player.x) ** 2 + (en.y - self.player.y) ** 2)
+        
+        orbit_r = 80  # Orbit radius around player
+        drone_damage = int(self.player.damage * 0.3 * getattr(self.player, "summon_damage_mult", 1.0))
+        
+        for d in self.drones:
+            # Keep even spacing - rotate together
+            base_offset = d["index"] * (math.tau / max(1, len(self.drones)))
+            d["angle"] = (d.get("angle", 0) + dt * 2.0) % math.tau
+            # Position at fixed offset for even distribution
+            actual_angle = d["angle"] + base_offset
+            d["x"] = self.player.x + math.cos(actual_angle) * orbit_r
+            d["y"] = self.player.y + math.sin(actual_angle) * orbit_r
+            d["cd"] -= dt
+            
+            # Shoot at target
+            if target and d["cd"] <= 0:
+                dx = target.x - d["x"]
+                dy = target.y - d["y"]
+                angle = math.atan2(dy, dx)
+                bdx = math.cos(angle)
+                bdy = math.sin(angle)
+                b = Bullet(d["x"], d["y"], bdx, bdy, drone_damage, self.player.bullet_speed * 0.7)
+                self.bullets.append(b)
+                d["cd"] = 0.8 / getattr(self.player, "summon_attack_speed_mult", 1.0)
+
+    def _update_dragon(self, dt):
+        """Update dragon companion - free movement that follows player and chases enemies."""
+        if not getattr(self.player, "dragon_active", False):
+            self.dragon = None
+            return
+        
+        if self.dragon is None:
+            self.dragon = {
+                "x": self.player.x + 60,
+                "y": self.player.y,
+                "vx": 0,
+                "vy": 0,
+                "cd": 0,
+                "max_dist": 350,  # Max distance from player before following
+                "chase_dist": 300  # How close dragon gets to enemies
+            }
+        
+        d = self.dragon
+        d["cd"] -= dt
+        
+        # Dragon movement AI
+        dragon_speed = 180  # Pixels per second
+        
+        # Check distance to player
+        dist_to_player = math.hypot(d["x"] - self.player.x, d["y"] - self.player.y)
+        
+        # Find enemy closest to the player (for more helpful targeting)
+        target_enemy = None
+        dist_to_enemy = 9999
+        if self.enemies:
+            target_enemy = min(self.enemies, key=lambda en: (en.x - self.player.x) ** 2 + (en.y - self.player.y) ** 2)
+            dist_to_enemy = math.hypot(target_enemy.x - d["x"], target_enemy.y - d["y"])
+        
+        # Decide what to do
+        if dist_to_player > d["max_dist"]:
+            # Too far from player - return to player
+            dx = self.player.x - d["x"]
+            dy = self.player.y - d["y"]
+            dist = max(1, math.hypot(dx, dy))
+            d["vx"] = (dx / dist) * dragon_speed
+            d["vy"] = (dy / dist) * dragon_speed
+        elif target_enemy and dist_to_enemy > d["chase_dist"] and dist_to_player < d["max_dist"] - 50:
+            # Enemy exists and we're not too far from player - chase enemy
+            dx = target_enemy.x - d["x"]
+            dy = target_enemy.y - d["y"]
+            dist = max(1, math.hypot(dx, dy))
+            d["vx"] = (dx / dist) * dragon_speed * 0.8
+            d["vy"] = (dy / dist) * dragon_speed * 0.8
+        elif target_enemy and dist_to_enemy <= d["chase_dist"]:
+            # Close to enemy - hover and attack
+            d["vx"] *= 0.9
+            d["vy"] *= 0.9
+        else:
+            # Idle near player - gentle float
+            angle_to_player = math.atan2(self.player.y - d["y"], self.player.x - d["x"])
+            d["vx"] = math.cos(angle_to_player) * 30
+            d["vy"] = math.sin(angle_to_player) * 30
+        
+        # Apply movement
+        d["x"] += d["vx"] * dt
+        d["y"] += d["vy"] * dt
+        
+        # Attack if close to enemy
+        if d["cd"] <= 0 and target_enemy and dist_to_enemy < 300:
+            dragon_damage = getattr(self.player, "dragon_damage", 20) * getattr(self.player, "summon_damage_mult", 1.0)
+            # Dragon breathes fire - apply burn
+            target_enemy.hp -= dragon_damage
+            target_enemy.burn_timer = max(target_enemy.burn_timer, 3.0)
+            target_enemy.burn_dps = max(target_enemy.burn_dps, dragon_damage * 0.3)
+            target_enemy.flash_timer = 0.1
+            self.damage_texts.append({"x": target_enemy.x, "y": target_enemy.y - 10, "val": int(dragon_damage), "life": 0.5, "color": (255, 100, 50)})
+            self._spawn_status_fx(target_enemy.x, target_enemy.y, kind="fire")
+            # Store fire breath target for visual
+            d["fire_target"] = {"x": target_enemy.x, "y": target_enemy.y, "timer": 0.3}
+            d["cd"] = 1.0 / getattr(self.player, "dragon_attack_speed", 1.0)
+        
+        # Update fire breath visual timer
+        if "fire_target" in d:
+            d["fire_target"]["timer"] -= dt
+            if d["fire_target"]["timer"] <= 0:
+                del d["fire_target"]
+
+    def _update_magic_lenses(self, dt):
+        """Update magic lens summons - orbit and multiply bullets passing through."""
+        target_count = getattr(self.player, "lens_count", 0)
+        
+        # Initialize lenses with proper spacing
+        while len(self.magic_lenses) < target_count:
+            base_angle = len(self.magic_lenses) * (math.tau / max(1, target_count))
+            self.magic_lenses.append({
+                "angle": base_angle,
+                "x": self.player.x,
+                "y": self.player.y
+            })
+        if len(self.magic_lenses) > target_count:
+            self.magic_lenses = self.magic_lenses[:target_count]
+        
+        if not self.magic_lenses:
+            return
+        
+        # Lens orbits around player, facing opposite direction
+        orbit_r = 100  # Closer to player
+        lens_radius = 25  # Size of lens hit area
+        orbit_speed = 1.2  # Radians per second for ALL lenses together
+        
+        # All lenses share the same rotation angle (orbit as a group)
+        if not hasattr(self, "_lens_orbit_angle"):
+            self._lens_orbit_angle = 0
+        self._lens_orbit_angle = (self._lens_orbit_angle + dt * orbit_speed) % math.tau
+        
+        # Update lens positions - all orbit together with even spacing
+        for i, lens in enumerate(self.magic_lenses):
+            # Evenly distributed, all rotating together
+            angle = self._lens_orbit_angle + i * (math.tau / max(1, len(self.magic_lenses)))
+            lens["angle"] = angle  # Store for drawing
+            lens["x"] = self.player.x + math.cos(angle) * orbit_r
+            lens["y"] = self.player.y + math.sin(angle) * orbit_r
+        
+        # Check for bullets passing through lenses
+        new_bullets = []
+        for b in self.bullets:
+            if getattr(b, "passed_through_lens", False):
+                continue  # Already multiplied
+            
+            for lens in self.magic_lenses:
+                dx = b.x - lens["x"]
+                dy = b.y - lens["y"]
+                dist = math.hypot(dx, dy)
+                
+                if dist < lens_radius:
+                    # Bullet passes through lens - always multiply by 2 (one extra bullet)
+                    b.passed_through_lens = True
+                    
+                    # Enlarge bullet if player has lens_enlarge upgrade (capped for size control)
+                    lens_enlarge = min(getattr(self.player, "lens_enlarge", 1.0), 1.18)
+                    if lens_enlarge > 1.0:
+                        b.radius = max(1, int(b.radius * lens_enlarge))
+                    
+                    # Create ONE additional bullet with slight spread
+                    spread_offset = 0.08
+                    bullet_angle = math.atan2(b.vy, b.vx) + spread_offset
+                    speed = math.hypot(b.vx, b.vy)
+                    new_b = Bullet(
+                        b.x, b.y,
+                        math.cos(bullet_angle), math.sin(bullet_angle),
+                        b.damage, speed,
+                        status=b.status.copy() if hasattr(b, "status") else {}
+                    )
+                    new_b.radius = max(1, int(b.radius * lens_enlarge)) if lens_enlarge > 1.0 else b.radius
+                    new_b.piercing = b.piercing
+                    new_b.passed_through_lens = True
+                    if hasattr(b, "pierce_left"):
+                        new_b.pierce_left = b.pierce_left
+                    new_bullets.append(new_b)
+                    break
+        
+        self.bullets.extend(new_bullets)
+
+    def _update_magic_shields(self, dt):
+        """Update orbiting shield summons."""
+        shield_hp = getattr(self.player, "shield_hp", 0)
+        if shield_hp <= 0:
+            self.magic_shields = []
+            return
+        
+        shield_count = getattr(self.player, "shield_segments", 1)
+        
+        # Initialize shields with proper spacing
+        while len(self.magic_shields) < shield_count:
+            base_angle = len(self.magic_shields) * (math.tau / max(1, shield_count))
+            self.magic_shields.append({
+                "angle": base_angle,
+                "x": self.player.x,
+                "y": self.player.y
+            })
+        if len(self.magic_shields) > shield_count:
+            self.magic_shields = self.magic_shields[:shield_count]
+        
+        # Shield orbit around player
+        orbit_r = 80  # Orbit distance close to player
+        orbit_speed = 1.5  # Radians per second for ALL shields together
+        
+        # All shields share the same rotation angle (orbit as a group)
+        if not hasattr(self, "_shield_orbit_angle"):
+            self._shield_orbit_angle = 0
+        self._shield_orbit_angle = (self._shield_orbit_angle + dt * orbit_speed) % math.tau
+        
+        # Update shield positions - all orbit together with even spacing
+        for i, shield in enumerate(self.magic_shields):
+            angle = self._shield_orbit_angle + i * (math.tau / max(1, len(self.magic_shields)))
+            shield["angle"] = angle  # Store for drawing
+            shield["x"] = self.player.x + math.cos(angle) * orbit_r
+            shield["y"] = self.player.y + math.sin(angle) * orbit_r
+
+    def _update_magic_scythes(self, dt):
+        """Update magic scythe summons - orbiting damage."""
+        target_count = getattr(self.player, "scythe_count", 0)
+        while len(self.magic_scythes) < target_count:
+            base_angle = len(self.magic_scythes) * (math.tau / max(1, target_count))
+            self.magic_scythes.append({
+                "angle": base_angle,
+                "cd": 0
+            })
+        if len(self.magic_scythes) > target_count:
+            self.magic_scythes = self.magic_scythes[:target_count]
+        
+        if not self.magic_scythes:
+            return
+        
+        orbit_r = 90
+        scythe_damage = getattr(self.player, "scythe_damage", 40) * getattr(self.player, "summon_damage_mult", 1.0)
+        
+        for scythe in self.magic_scythes:
+            scythe["angle"] += dt * 3.5
+            scythe["cd"] -= dt
+            sx = self.player.x + math.cos(scythe["angle"]) * orbit_r
+            sy = self.player.y + math.sin(scythe["angle"]) * orbit_r
+            scythe["x"] = sx
+            scythe["y"] = sy
+            
+            if scythe["cd"] <= 0:
+                # Check for enemy collisions
+                for en in self.enemies:
+                    dx = en.x - sx
+                    dy = en.y - sy
+                    if dx * dx + dy * dy < (en.radius + 25) ** 2:
+                        en.hp -= scythe_damage
+                        en.flash_timer = 0.1
+                        self.damage_texts.append({"x": en.x, "y": en.y - 10, "val": int(scythe_damage), "life": 0.4, "color": (100, 255, 100)})
+                        scythe["cd"] = 0.3
+                        break
+
+    def _update_magic_spears(self, dt):
+        """Update magic spear summons - stabbing attacks."""
+        target_count = getattr(self.player, "spear_count", 0)
+        while len(self.magic_spears) < target_count:
+            self.magic_spears.append({
+                "angle": random.uniform(0, math.tau),
+                "cd": random.uniform(0.3, 0.6),
+                "state": "orbit",  # orbit or attack
+                "target_x": 0,
+                "target_y": 0
+            })
+        if len(self.magic_spears) > target_count:
+            self.magic_spears = self.magic_spears[:target_count]
+        
+        if not self.magic_spears:
+            return
+        
+        orbit_r = 70
+        spear_damage = getattr(self.player, "spear_damage", 20) * getattr(self.player, "summon_damage_mult", 1.0)
+        
+        for spear in self.magic_spears:
+            spear["cd"] -= dt
+            spear["angle"] += dt * 1.5
+            spear["x"] = self.player.x + math.cos(spear["angle"]) * orbit_r
+            spear["y"] = self.player.y + math.sin(spear["angle"]) * orbit_r
+            
+            if spear["cd"] <= 0 and self.enemies:
+                target = min(self.enemies, key=lambda en: (en.x - spear["x"]) ** 2 + (en.y - spear["y"]) ** 2)
+                dist = math.hypot(target.x - spear["x"], target.y - spear["y"])
+                if dist < 200:
+                    target.hp -= spear_damage
+                    target.flash_timer = 0.1
+                    self.damage_texts.append({"x": target.x, "y": target.y - 10, "val": int(spear_damage), "life": 0.4, "color": (255, 200, 100)})
+                    spear["cd"] = 0.8 / getattr(self.player, "summon_attack_speed_mult", 1.0)
+
+    def _update_gale(self, dt):
+        """Update gale AoE damage around player."""
+        if self.upgrade_manager.should_gale_fire():
+            gale_damage = getattr(self.player, "gale_damage", 20)
+            gale_radius = 150
+            if getattr(self.player, "gale_scales_speed", False):
+                gale_damage *= (self.player.speed / 5.0)
+            
+            for en in self.enemies:
+                dx = en.x - self.player.x
+                dy = en.y - self.player.y
+                dist_sq = dx * dx + dy * dy
+                if dist_sq < gale_radius ** 2:
+                    # Center bonus damage
+                    if dist_sq < 50 ** 2 and getattr(self.player, "gale_center_damage_mult", 0) > 0:
+                        dmg = gale_damage * self.player.gale_center_damage_mult
+                    else:
+                        dmg = gale_damage
+                    en.hp -= dmg
+                    en.flash_timer = 0.1
+                    self.damage_texts.append({"x": en.x, "y": en.y - 10, "val": int(dmg), "life": 0.4, "color": (150, 200, 255)})
+
+    def _update_glare(self, dt):
+        """Update glare - full screen flash that damages all visible enemies."""
+        if not self.upgrade_manager.should_glare_fire():
+            return
+        
+        p = self.player
+        glare_damage = getattr(p, "glare_damage", 20)
+        glare_slow = getattr(p, "glare_slow", 0)
+        glare_stun = getattr(p, "glare_stun", False)
+        glare_stun_duration = getattr(p, "glare_stun_duration", 1.0)
+        glare_execute = getattr(p, "glare_execute", 0)
+        
+        # Flash effect
+        self.glare_flash_timer = 0.3
+        
+        # Damage all enemies on screen
+        cam = self.get_camera()
+        for en in self.enemies:
+            # Check if enemy is on screen
+            sx = en.x - cam[0]
+            sy = en.y - cam[1]
+            if 0 <= sx <= self.w and 0 <= sy <= self.h:
+                # Execute check
+                if glare_execute > 0 and en.hp / en.max_hp <= glare_execute:
+                    en.hp = 0
+                    self.damage_texts.append({"x": en.x, "y": en.y - 10, "val": "EXECUTE", "life": 0.6, "color": COLOR_RED})
+                else:
+                    en.hp -= glare_damage
+                    en.flash_timer = 0.15
+                    self.damage_texts.append({"x": en.x, "y": en.y - 10, "val": int(glare_damage), "life": 0.4, "color": (255, 255, 200)})
+                
+                # Apply slow
+                if glare_slow > 0:
+                    en.ice_timer = max(en.ice_timer, 2.0)
+                
+                # Apply stun
+                if glare_stun:
+                    en.knockback_pause = max(en.knockback_pause, glare_stun_duration)
+
+    def _handle_shot_effects(self, effects: dict, target_pos: tuple):
+        """Handle special effects triggered by shooting."""
+        if "lightning" in effects:
+            data = effects["lightning"]
+            self._spawn_lightning(target_pos, data["damage"], data.get("area_mult", 1.0))
+        
+        if "fireball" in effects:
+            data = effects["fireball"]
+            self._spawn_fireball(target_pos, data["damage"])
+
+    def _handle_empty_mag_effects(self, effects: dict):
+        """Handle special effects triggered when magazine empties."""
+        if "smite" in effects:
+            data = effects["smite"]
+            self._spawn_smite(data["damage"])
+        
+        if "fan_fire" in effects:
+            data = effects["fan_fire"]
+            self._spawn_fan_fire(data["count"], data["damage_ratio"])
+        
+        if "ice_shards" in effects:
+            data = effects["ice_shards"]
+            self._spawn_ice_shards(data["count"], data.get("freeze", True))
+
+    def _spawn_lightning(self, target_pos, damage, area_mult=1.0):
+        """Spawn a lightning strike at the target position."""
+        tx, ty = target_pos
+        radius = 80 * area_mult
+        
+        # Add visual effect
+        self.lightning_fx.append({
+            "x": tx, "y": ty,
+            "radius": radius,
+            "life": 0.3
+        })
+        
+        # Damage enemies in radius
+        for en in self.enemies:
+            dx = en.x - tx
+            dy = en.y - ty
+            if dx * dx + dy * dy < radius ** 2:
+                en.hp -= damage
+                en.flash_timer = 0.15
+                self.damage_texts.append({"x": en.x, "y": en.y - 10, "val": int(damage), "life": 0.5, "color": (255, 255, 100)})
+                # Electro bug - chain to nearby enemies
+                if getattr(self.player, "electro_bug", False):
+                    chain_targets = getattr(self.player, "electro_bug_targets", 2)
+                    chain_count = 0
+                    for other in self.enemies:
+                        if other is en or chain_count >= chain_targets:
+                            break
+                        odx = other.x - en.x
+                        ody = other.y - en.y
+                        if odx * odx + ody * ody < 100 ** 2:
+                            other.hp -= damage * 0.5
+                            other.flash_timer = 0.1
+                            chain_count += 1
+
+    def _spawn_fireball(self, target_pos, damage):
+        """Spawn a fireball at the target position."""
+        tx, ty = target_pos
+        radius = 60
+        
+        self.fireball_fx.append({
+            "x": tx, "y": ty,
+            "radius": radius,
+            "life": 0.4
+        })
+        
+        for en in self.enemies:
+            dx = en.x - tx
+            dy = en.y - ty
+            if dx * dx + dy * dy < radius ** 2:
+                en.hp -= damage
+                en.burn_timer = max(en.burn_timer, 3.0)
+                en.burn_dps = max(en.burn_dps, damage * 0.3)
+                en.flash_timer = 0.15
+                self.damage_texts.append({"x": en.x, "y": en.y - 10, "val": int(damage), "life": 0.5, "color": (255, 100, 50)})
+                self._spawn_status_fx(en.x, en.y, kind="fire")
+
+    def _spawn_smite(self, damage):
+        """Spawn holy smite damaging all nearby enemies."""
+        radius = 200
+        for en in self.enemies:
+            dx = en.x - self.player.x
+            dy = en.y - self.player.y
+            if dx * dx + dy * dy < radius ** 2:
+                en.hp -= damage
+                en.flash_timer = 0.2
+                self.damage_texts.append({"x": en.x, "y": en.y - 10, "val": int(damage), "life": 0.5, "color": (255, 255, 200)})
+
+    def _spawn_fan_fire(self, count, damage_ratio):
+        """Spawn a circle of bullets around the player."""
+        damage = int(self.player.damage * damage_ratio)
+        for i in range(count):
+            angle = (math.tau / count) * i
+            vx = math.cos(angle)
+            vy = math.sin(angle)
+            b = Bullet(self.player.x, self.player.y, vx, vy, damage, self.player.bullet_speed * 0.8, status=self.player.bullet_status.copy())
+            self.bullets.append(b)
+
+    def _spawn_ice_shards(self, count, freeze):
+        """Spawn ice shards around the player."""
+        damage = int(self.player.damage * 0.3)
+        status = {"ice": True, "burn": False, "poison": False}
+        for i in range(count):
+            angle = (math.tau / count) * i
+            vx = math.cos(angle)
+            vy = math.sin(angle)
+            b = Bullet(self.player.x, self.player.y, vx, vy, damage, self.player.bullet_speed * 0.6, status=status)
+            self.bullets.append(b)
+
+    def _spawn_splinter_bullets(self, x, y):
+        """Spawn splinter bullets from a dead enemy position."""
+        count = self.player.splinter_count
+        damage = int(self.player.damage * self.player.splinter_damage_ratio)
+        for i in range(count):
+            angle = random.uniform(0, math.tau)
+            vx = math.cos(angle)
+            vy = math.sin(angle)
+            b = Bullet(x, y, vx, vy, damage, self.player.bullet_speed * 0.7, status=self.player.bullet_status.copy())
+            b.splinter = True  # Mark as splinter so they don't trigger more splinters
+            self.bullets.append(b)
+
+    def _update_lightning_fx(self, dt):
+        """Update lightning visual effects."""
+        for fx in list(self.lightning_fx):
+            fx["life"] -= dt
+            if fx["life"] <= 0:
+                self.lightning_fx.remove(fx)
+
+    def _update_fireball_fx(self, dt):
+        """Update fireball visual effects."""
+        for fx in list(self.fireball_fx):
+            fx["life"] -= dt
+            if fx["life"] <= 0:
+                self.fireball_fx.remove(fx)
+
     def spawn_enemy(self):
         half = WORLD_SIZE / 2
         dmin, dmax = 600, 900
@@ -1271,85 +2202,124 @@ class Game:
         x = clamp(x, -half, half)
         y = clamp(y, -half, half)
 
-        # choose enemy type based on elapsed time
+        # Gradual scaling based on elapsed time
         t = self.elapsed_time
-        hp_scale = 1.0 + (t / 90.0)
-        speed_scale = 1.0 + (t / 180.0)
+        
+        # Very gradual HP scaling: starts at 1.0, reaches 2.0 at 3 min, 3.0 at 6 min
+        hp_scale = 1.0 + (t / 180.0)
+        # Even more gradual speed scaling: starts at 1.0, reaches 1.3 at 3 min
+        speed_scale = 1.0 + (t / 600.0)  # Much slower speed scaling
 
-        # timed boss every minute
-        if int(t // 60) > self.bosses_spawned:
+        # Timed boss - test mode: 10s, normal: 60s
+        boss_interval = 10 if self.test_mode else 60
+        if int(t // boss_interval) > self.bosses_spawned:
             self.bosses_spawned += 1
             kind = "boss"
             boss_stage = self.bosses_spawned
         else:
-            pool = ["normal", "fast", "tank"]
-            weights = [0.45, 0.25, 0.2]
-            if t >= 180:
-                pool.append("shooter")
-                weights.append(0.15)
-            if t > 90:
+            # Gradual enemy type unlocking with weighted spawns
+            # Start with mostly normals, slowly introduce others
+            pool = ["normal"]
+            weights = [1.0]
+            
+            # Fast enemies unlock at 45s, low chance initially
+            if t >= 45:
+                pool.append("fast")
+                fast_weight = min(0.25, (t - 45) / 120)  # Ramps up over 2 min
+                weights.append(fast_weight)
+            
+            # Tank enemies unlock at 90s
+            if t >= 90:
+                pool.append("tank")
+                tank_weight = min(0.20, (t - 90) / 120)
+                weights.append(tank_weight)
+            
+            # Sprinter enemies unlock at 150s (2.5 min) - was too early at 90s
+            if t >= 150:
                 pool.append("sprinter")
-                weights.append(0.15)
-            if t > 120:
+                sprinter_weight = min(0.15, (t - 150) / 180)  # Slow ramp
+                weights.append(sprinter_weight)
+            
+            # Bruiser enemies unlock at 180s (3 min)
+            if t >= 180:
                 pool.append("bruiser")
-                weights.append(0.2)
+                bruiser_weight = min(0.15, (t - 180) / 120)
+                weights.append(bruiser_weight)
+            
+            # Shooter enemies unlock at 240s (4 min) - very rare at first
+            if t >= 240:
+                pool.append("shooter")
+                shooter_weight = min(0.10, (t - 240) / 180)
+                weights.append(shooter_weight)
+            
             kind = random.choices(pool, weights=weights, k=1)[0]
             boss_stage = 0
 
+        # Enemy stats with gradual scaling
         if kind == "tank":
-            hp = int(ENEMY_BASE_HP * 3 * hp_scale)
-            speed = ENEMY_BASE_SPEED * 0.7 * speed_scale
+            hp = int(ENEMY_BASE_HP * 2.5 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 0.6 * speed_scale
         elif kind == "fast":
-            hp = int(ENEMY_BASE_HP * 0.7 * hp_scale)
-            speed = ENEMY_BASE_SPEED * 1.8 * speed_scale
+            hp = int(ENEMY_BASE_HP * 0.6 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 1.5 * speed_scale
         elif kind == "sprinter":
-            hp = int(ENEMY_BASE_HP * 0.8 * hp_scale)
-            speed = ENEMY_BASE_SPEED * 2.4 * speed_scale
+            hp = int(ENEMY_BASE_HP * 0.5 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 1.8 * speed_scale  # Reduced from 2.4
         elif kind == "bruiser":
-            hp = int(ENEMY_BASE_HP * 4.0 * hp_scale)
-            speed = ENEMY_BASE_SPEED * 0.9 * speed_scale
+            hp = int(ENEMY_BASE_HP * 3.5 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 0.8 * speed_scale
         elif kind == "shooter":
-            hp = int(ENEMY_BASE_HP * 1.4 * hp_scale)
-            speed = ENEMY_BASE_SPEED * 1.0 * speed_scale
+            hp = int(ENEMY_BASE_HP * 1.2 * hp_scale)
+            speed = ENEMY_BASE_SPEED * 0.9 * speed_scale
         elif kind == "boss":
             if boss_stage == 1:
-                hp = int(ENEMY_BASE_HP * 14 * hp_scale)
-                speed = ENEMY_BASE_SPEED * 1.2 * speed_scale
+                hp = int(ENEMY_BASE_HP * 12 * hp_scale)
+                speed = ENEMY_BASE_SPEED * 1.0 * speed_scale
             elif boss_stage == 2:
-                hp = int(ENEMY_BASE_HP * 18 * hp_scale)
-                speed = ENEMY_BASE_SPEED * 1.45 * speed_scale
+                hp = int(ENEMY_BASE_HP * 16 * hp_scale)
+                speed = ENEMY_BASE_SPEED * 1.2 * speed_scale
             else:
-                hp = int(ENEMY_BASE_HP * 24 * hp_scale)
-                speed = ENEMY_BASE_SPEED * 1.6 * speed_scale
-        else:
+                hp = int(ENEMY_BASE_HP * 22 * hp_scale)
+                speed = ENEMY_BASE_SPEED * 1.4 * speed_scale
+        else:  # normal
             hp = int(ENEMY_BASE_HP * 1.0 * hp_scale)
             speed = ENEMY_BASE_SPEED * 1.0 * speed_scale
 
         self.enemies.append(Enemy(x, y, hp, speed, kind, boss_stage=boss_stage))
 
     def roll_levelup(self):
-        if self.dev_mode and self.dev_power_queue:
-            self.levelup_options = self.dev_power_queue[:3]
-            self.dev_power_queue = self.dev_power_queue[3:]
+        """Roll available upgrades for level-up screen using the new upgrade tree system."""
+        if self.test_mode and self.test_power_queue:
+            # Test mode: cycle through all upgrades from upgrade trees
+            self.levelup_options = self.test_power_queue[:3]
+            self.test_power_queue = self.test_power_queue[3:]
         else:
-            pool = available_powerups(self.player)
-            if len(pool) >= 3:
-                self.levelup_options = random.sample(pool, k=3)
-            elif pool:
-                # allow duplicates if few options remain
-                self.levelup_options = random.choices(pool, k=min(3, len(pool)))
-            else:
-                self.levelup_options = []
+            # Use new upgrade tree system
+            available_upgrades = self.upgrade_manager.get_available_options(count=3)
+            self.levelup_options = [u.id for u in available_upgrades]
+        
         self.state = STATE_LEVEL_UP
         audio.play_sfx(audio.snd_level_up)
+    
+    def apply_levelup_choice(self, upgrade_id: str):
+        """Apply the selected upgrade from level-up screen."""
+        if upgrade_id in UPGRADES_BY_ID:
+            # New upgrade tree system
+            # In test mode with tier 3 upgrades, apply full tree
+            upgrade = UPGRADES_BY_ID[upgrade_id]
+            apply_full = self.test_mode and upgrade.tier == 3
+            self.upgrade_manager.apply_upgrade(upgrade_id, apply_full_tree=apply_full)
+        else:
+            # Fall back to old powerup system for legacy support
+            apply_powerup(self.player, upgrade_id)
 
     def roll_evolution(self):
         self.evolution_options = random.sample(EVOLUTIONS, k=min(3, len(EVOLUTIONS)))
         self.state = STATE_EVOLUTION
         audio.play_sfx(audio.snd_level_up)
 
-    def _grant_dev_power(self, pid: str):
-        if not self.dev_mode:
+    def _grant_test_power(self, pid: str):
+        if not self.test_mode:
             return
         if hasattr(self, "player") and self.player:
             apply_powerup(self.player, pid)
@@ -1399,6 +2369,7 @@ class Game:
         elif self.state in (STATE_PLAYING, STATE_LEVEL_UP, STATE_EVOLUTION, STATE_GAME_OVER, STATE_PAUSED, STATE_DEAD_ANIM):
             self.draw_game_world()
             self.draw_boost_overlay()
+            self.draw_glare_flash_overlay()
             self.draw_vision_overlay()
             self.draw_hud()
             if self.state == STATE_LEVEL_UP:
@@ -1416,7 +2387,7 @@ class Game:
     def draw_menu(self):
         cam = (0, 0)
         self.draw_background(cam)
-        title = self.font_large.render("STARLIGHT ECLIPSE", True, COLOR_WHITE)
+        title = self.font_large.render("SPACE INVADERS", True, COLOR_WHITE)
         self.screen.blit(title, (self.w // 2 - title.get_width() // 2, self.h // 3 - 40))
         self.btn_start.draw(self.screen)
         self.btn_settings.draw(self.screen)
@@ -1516,8 +2487,132 @@ class Game:
             sy = int(m.get("y", self.player.y) - cam[1])
             pygame.draw.circle(render_surf, (180, 255, 255), (sx, sy), 10)
             pygame.draw.circle(render_surf, (60, 180, 220), (sx, sy), 6)
+        # Draw magic lenses - smooth arcs orbiting player facing outward
+        for lens in self.magic_lenses:
+            lx = int(lens.get("x", self.player.x) - cam[0])
+            ly = int(lens.get("y", self.player.y) - cam[1])
+            
+            # Calculate angle from player to lens (so arc faces OUTWARD)
+            # Note: pygame y-axis is flipped, so we negate dy for correct angle
+            px = int(self.player.x - cam[0])
+            py = int(self.player.y - cam[1])
+            angle_outward = math.atan2(-(ly - py), lx - px)  # Negate y for pygame coords
+            
+            # Draw smooth arc facing outward (away from player) - 2x wider
+            arc_size = 40  
+            arc_rect = pygame.Rect(lx - arc_size // 2, ly - arc_size // 2, arc_size, arc_size)
+            # Arc centered on the outward direction
+            start_ang = angle_outward - math.pi * 0.35
+            end_ang = angle_outward + math.pi * 0.35
+            
+            # Draw solid arc
+            pygame.draw.arc(render_surf, (255, 100, 100), arc_rect, start_ang, end_ang, 4)
+        # Draw magic scythes
+        for scythe in self.magic_scythes:
+            sx = int(scythe.get("x", self.player.x) - cam[0])
+            sy = int(scythe.get("y", self.player.y) - cam[1])
+            # Draw a curved scythe shape
+            pygame.draw.arc(render_surf, (100, 255, 100), (sx - 15, sy - 15, 30, 30), 0, math.pi, 4)
+        # Draw magic spears
+        for spear in self.magic_spears:
+            px = int(spear.get("x", self.player.x) - cam[0])
+            py = int(spear.get("y", self.player.y) - cam[1])
+            # Draw spear pointing outward from player
+            ang = spear.get("angle", 0)
+            end_x = px + int(math.cos(ang) * 20)
+            end_y = py + int(math.sin(ang) * 20)
+            pygame.draw.line(render_surf, (255, 200, 100), (px, py), (end_x, end_y), 4)
+        # Draw lightning effects
+        for fx in self.lightning_fx:
+            lx = int(fx["x"] - cam[0])
+            ly = int(fx["y"] - cam[1])
+            alpha = int(255 * (fx["life"] / 0.3))
+            r = int(fx["radius"])
+            surf = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (255, 255, 100, alpha), (r, r), r)
+            pygame.draw.circle(surf, (255, 255, 200, min(255, alpha + 50)), (r, r), r // 2)
+            render_surf.blit(surf, (lx - r, ly - r))
+        # Draw fireball effects
+        for fx in self.fireball_fx:
+            fx_x = int(fx["x"] - cam[0])
+            fx_y = int(fx["y"] - cam[1])
+            alpha = int(255 * (fx["life"] / 0.4))
+            r = int(fx["radius"])
+            surf = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (255, 100, 50, alpha), (r, r), r)
+            pygame.draw.circle(surf, (255, 200, 100, min(255, alpha + 50)), (r, r), r // 2)
+            render_surf.blit(surf, (fx_x - r, fx_y - r))
         for e in self.enemies:
             e.draw(render_surf, cam)
+        # Draw drones/phantoms/dragon IN FRONT of enemies (higher z-index)
+        # Draw ghosts as ghostly spirits (they touch to damage)
+        for g in self.ghosts:
+            gx = int(g.get("x", self.player.x) - cam[0])
+            gy = int(g.get("y", self.player.y) - cam[1])
+            # Ghost - spooky translucent look
+            ghost_surf = pygame.Surface((30, 30), pygame.SRCALPHA)
+            pygame.draw.circle(ghost_surf, (150, 200, 150, 120), (15, 12), 12)  # Green tint
+            pygame.draw.circle(ghost_surf, (180, 230, 180, 160), (15, 12), 8)
+            pygame.draw.circle(ghost_surf, (220, 255, 220, 200), (15, 10), 4)
+            # Wispy tail
+            for i in range(3):
+                tail_x = 15 + (i - 1) * 4
+                tail_y = 22 + i * 2
+                pygame.draw.circle(ghost_surf, (150, 200, 150, 80 - i * 20), (tail_x, tail_y), 4 - i)
+            render_surf.blit(ghost_surf, (gx - 15, gy - 15))
+        # Draw orbiting drones (they orbit and shoot)
+        for d in self.drones:
+            dx_d = int(d.get("x", self.player.x) - cam[0])
+            dy_d = int(d.get("y", self.player.y) - cam[1])
+            # Drone body - metallic look
+            pygame.draw.circle(render_surf, (80, 120, 160), (dx_d, dy_d), 12)
+            pygame.draw.circle(render_surf, (140, 180, 220), (dx_d, dy_d), 8)
+            pygame.draw.circle(render_surf, (200, 220, 255), (dx_d, dy_d), 4)
+            # Drone wings
+            pygame.draw.line(render_surf, (100, 140, 180), (dx_d - 12, dy_d), (dx_d - 20, dy_d - 5), 2)
+            pygame.draw.line(render_surf, (100, 140, 180), (dx_d + 12, dy_d), (dx_d + 20, dy_d - 5), 2)
+        for p in getattr(self, "phantoms", []):
+            px = int(p.get("x", self.player.x) - cam[0])
+            py = int(p.get("y", self.player.y) - cam[1])
+            # Ghostly translucent appearance
+            phantom_surf = pygame.Surface((30, 30), pygame.SRCALPHA)
+            pygame.draw.circle(phantom_surf, (180, 180, 255, 100), (15, 12), 12)
+            pygame.draw.circle(phantom_surf, (220, 220, 255, 150), (15, 12), 8)
+            pygame.draw.circle(phantom_surf, (255, 255, 255, 180), (15, 10), 4)
+            for i in range(3):
+                tail_x = 15 + (i - 1) * 5
+                tail_y = 22 + i * 2
+                pygame.draw.circle(phantom_surf, (200, 200, 255, 80 - i * 20), (tail_x, tail_y), 4 - i)
+            render_surf.blit(phantom_surf, (px - 15, py - 15))
+        if self.dragon:
+            dx = int(self.dragon["x"] - cam[0])
+            dy = int(self.dragon["y"] - cam[1])
+            # Draw fire breath if attacking
+            if "fire_target" in self.dragon:
+                ft = self.dragon["fire_target"]
+                tx = int(ft["x"] - cam[0])
+                ty = int(ft["y"] - cam[1])
+                # Draw fire breath line with gradient
+                for i in range(3):
+                    width = 8 - i * 2
+                    alpha = int(200 * (ft["timer"] / 0.3))
+                    color = (255, 150 + i * 30, 50 + i * 40)
+                    pygame.draw.line(render_surf, color, (dx, dy), (tx, ty), width)
+                # Fire burst at target
+                burst_r = int(15 * (ft["timer"] / 0.3))
+                pygame.draw.circle(render_surf, (255, 200, 100), (tx, ty), burst_r)
+            # Dragon body
+            pygame.draw.circle(render_surf, (255, 80, 30), (dx, dy), 20)
+            pygame.draw.circle(render_surf, (255, 150, 50), (dx, dy), 14)
+            pygame.draw.circle(render_surf, (255, 220, 100), (dx, dy), 8)
+            wing_pts_l = [(dx - 8, dy), (dx - 28, dy - 12), (dx - 20, dy + 8)]
+            wing_pts_r = [(dx + 8, dy), (dx + 28, dy - 12), (dx + 20, dy + 8)]
+            pygame.draw.polygon(render_surf, (255, 120, 40), wing_pts_l)
+            pygame.draw.polygon(render_surf, (255, 120, 40), wing_pts_r)
+            pygame.draw.circle(render_surf, (255, 255, 255), (dx - 5, dy - 4), 4)
+            pygame.draw.circle(render_surf, (255, 255, 255), (dx + 5, dy - 4), 4)
+            pygame.draw.circle(render_surf, (0, 0, 0), (dx - 5, dy - 4), 2)
+            pygame.draw.circle(render_surf, (0, 0, 0), (dx + 5, dy - 4), 2)
         for b in self.bullets:
             b.draw(render_surf, cam)
         for eb in self.enemy_bullets:
@@ -1537,7 +2632,70 @@ class Game:
             pygame.draw.circle(flash, (255, 200, 140, 190), (burst_r, burst_r), burst_r)
             pygame.draw.circle(flash, (255, 255, 240, 230), (burst_r, burst_r), max(8, burst_r // 2))
             render_surf.blit(flash, (start[0] - burst_r, start[1] - burst_r))
-        self.player.draw(render_surf, center=(render_w // 2, render_h // 2))
+        # Glare cone visual
+        if getattr(self.player, "glare_dps", 0) > 0:
+            mx, my = pygame.mouse.get_pos()
+            glare_range = 300
+            glare_cone = 0.5
+            aim_dx = mx - render_w // 2
+            aim_dy = my - render_h // 2
+            aim_dist = math.hypot(aim_dx, aim_dy)
+            if aim_dist > 1:
+                aim_dx /= aim_dist
+                aim_dy /= aim_dist
+                # Draw semi-transparent cone
+                glare_surf = pygame.Surface((render_w, render_h), pygame.SRCALPHA)
+                px = render_w // 2
+                py = render_h // 2
+                # Calculate cone edges
+                half_angle = math.acos(glare_cone)
+                base_angle = math.atan2(aim_dy, aim_dx)
+                left_angle = base_angle + half_angle
+                right_angle = base_angle - half_angle
+                # Draw cone as polygon
+                points = [
+                    (px, py),
+                    (px + int(math.cos(left_angle) * glare_range), py + int(math.sin(left_angle) * glare_range)),
+                    (px + int(aim_dx * glare_range), py + int(aim_dy * glare_range)),
+                    (px + int(math.cos(right_angle) * glare_range), py + int(math.sin(right_angle) * glare_range))
+                ]
+                pygame.draw.polygon(glare_surf, (255, 220, 100, 50), points)
+                pygame.draw.polygon(glare_surf, (255, 255, 200, 100), points, 2)
+                render_surf.blit(glare_surf, (0, 0))
+        
+        # Calculate aim angle accounting for zoom
+        mx, my = pygame.mouse.get_pos()
+        # Convert screen mouse coords to render surface coords
+        screen_center_x = self.w // 2
+        screen_center_y = self.h // 2
+        # Mouse offset from screen center, scaled to render surface
+        aim_dx = (mx - screen_center_x) / zoom
+        aim_dy = (my - screen_center_y) / zoom
+        aim_angle = math.atan2(aim_dy, aim_dx)
+        
+        self.player.draw(render_surf, center=(render_w // 2, render_h // 2), aim_angle=aim_angle)
+        
+        # Draw orbiting shields (C-shaped barriers orbiting around player)
+        for shield in self.magic_shields:
+            sx = int(shield.get("x", self.player.x) - cam[0])
+            sy = int(shield.get("y", self.player.y) - cam[1])
+            
+            # Calculate angle from player to shield (so arc faces OUTWARD)
+            # Note: pygame y-axis is flipped, so we negate dy for correct angle
+            px = int(self.player.x - cam[0])
+            py = int(self.player.y - cam[1])
+            angle_outward = math.atan2(-(sy - py), sx - px)  # Negate y for pygame coords
+            
+            # Draw smooth arc shield facing outward - 3x wider
+            arc_size = 45  
+            arc_rect = pygame.Rect(sx - arc_size // 2, sy - arc_size // 2, arc_size, arc_size)
+            # Arc centered on the outward direction
+            start_ang = angle_outward - math.pi * 0.4
+            end_ang = angle_outward + math.pi * 0.4
+            
+            # Draw solid arc
+            pygame.draw.arc(render_surf, (100, 180, 255), arc_rect, start_ang, end_ang, 5)
+        
         self._draw_death_fx(cam, target=render_surf)
         self._draw_damage_texts(cam, target=render_surf)
 
@@ -1556,6 +2714,17 @@ class Game:
             color = (80, 240, 220, alpha)
             pygame.draw.rect(overlay, color, (i, 0, 1, self.h))
             pygame.draw.rect(overlay, color, (self.w - i - 1, 0, 1, self.h))
+        self.screen.blit(overlay, (0, 0))
+
+    def draw_glare_flash_overlay(self):
+        """Draw full-screen white flash when glare fires."""
+        if self.glare_flash_timer <= 0:
+            return
+        # Quick white flash that fades
+        strength = min(1.0, self.glare_flash_timer / 0.15)
+        alpha = int(180 * strength)
+        overlay = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        overlay.fill((255, 255, 200, alpha))
         self.screen.blit(overlay, (0, 0))
 
     def draw_vision_overlay(self):
@@ -1585,6 +2754,50 @@ class Game:
             surf = self.font_small.render(str(txt["val"]), True, color)
             surf.set_alpha(alpha)
             surface.blit(surf, (sx, sy))
+
+    def _get_wrapped_lines(self, text, font, max_width):
+        """Get list of lines after wrapping text to max_width."""
+        words = text.split()
+        lines = []
+        current_line = ""
+        
+        for word in words:
+            test_line = current_line + (" " if current_line else "") + word
+            test_surf = font.render(test_line, True, (255, 255, 255))
+            if test_surf.get_width() <= max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+        return lines if lines else [""]
+
+    def _draw_wrapped_text(self, text, font, center_x, start_y, max_width, color):
+        """Draw text that wraps to multiple lines, centered."""
+        words = text.split()
+        lines = []
+        current_line = ""
+        
+        for word in words:
+            test_line = current_line + (" " if current_line else "") + word
+            test_surf = font.render(test_line, True, color)
+            if test_surf.get_width() <= max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+        
+        line_height = font.get_height() + 2
+        for i, line in enumerate(lines):
+            surf = font.render(line, True, color)
+            x = center_x - surf.get_width() // 2
+            y = start_y + i * line_height
+            self.screen.blit(surf, (x, y))
 
     def draw_hud(self):
         base_y = self.btn_pause.rect.y + 6
@@ -1663,39 +2876,75 @@ class Game:
         title = self.font_large.render("LEVEL UP", True, COLOR_YELLOW)
         self.screen.blit(title, (self.w // 2 - title.get_width() // 2, self.h // 4))
         w = 320
-        h = 150
+        h = 180  # Taller to fit wrapped text
         gap = 24
         total_w = 3 * w + 2 * gap
         start_x = WIDTH // 2 - total_w // 2
         y = HEIGHT // 2 - h // 2
         mouse_pos = pygame.mouse.get_pos()
-        for i, pid in enumerate(self.levelup_options):
+        for i, uid in enumerate(self.levelup_options):
             rect = pygame.Rect(start_x + i * (w + gap), y, w, h)
             is_hover = rect.collidepoint(mouse_pos)
             col = COLOR_DARK_GRAY if not is_hover else COLOR_GRAY
             pygame.draw.rect(self.screen, col, rect, border_radius=8)
-            name = powerup_name(pid)
-            desc = powerup_desc(pid)
+            
+            # Get upgrade info - try new system first, fall back to old
+            if uid in UPGRADES_BY_ID:
+                upgrade = UPGRADES_BY_ID[uid]
+                name = upgrade.name
+                desc = upgrade.description
+                tier_text = f"T{upgrade.tier}" + (" ★" if upgrade.is_ultimate else "")
+            else:
+                name = powerup_name(uid)
+                desc = powerup_desc(uid)
+                tier_text = ""
+            
+            # Draw tier indicator at top-left corner
+            if tier_text:
+                tier_col = COLOR_YELLOW if "★" in tier_text else (180, 180, 200)
+                t3 = self.font_tiny.render(tier_text, True, tier_col)
+                self.screen.blit(t3, (rect.x + 8, rect.y + 8))
+            
+            # Calculate content height to center vertically
             t1 = self.font_small.render(name, True, COLOR_WHITE)
-            t2 = self.font_tiny.render(desc, True, COLOR_WHITE)
-            self.screen.blit(
-                t1,
-                (rect.centerx - t1.get_width() // 2, rect.y + rect.height // 2 - t1.get_height()),
-            )
-            self.screen.blit(
-                t2,
-                (rect.centerx - t2.get_width() // 2, rect.y + rect.height // 2 + 4),
-            )
+            name_h = t1.get_height()
+            
+            # Count description lines for height calculation
+            desc_lines = self._get_wrapped_lines(desc, self.font_micro, w - 20)
+            desc_line_h = self.font_micro.get_height() + 2
+            desc_total_h = len(desc_lines) * desc_line_h
+            
+            # Total content height = name + gap + description
+            content_h = name_h + 12 + desc_total_h
+            content_start_y = rect.centery - content_h // 2
+            
+            # Draw name centered horizontally, positioned vertically
+            self.screen.blit(t1, (rect.centerx - t1.get_width() // 2, content_start_y))
+            
+            # Draw wrapped description below name
+            desc_y = content_start_y + name_h + 12
+            max_width = w - 20
+            self._draw_wrapped_text(desc, self.font_micro, rect.centerx, desc_y, max_width, (200, 200, 200))
+        
+        # Test mode skip button
+        if self.test_mode:
+            skip_rect = pygame.Rect(WIDTH // 2 - 80, y + h + 30, 160, 40)
+            is_skip_hover = skip_rect.collidepoint(mouse_pos)
+            skip_col = COLOR_GRAY if is_skip_hover else COLOR_DARK_GRAY
+            pygame.draw.rect(self.screen, skip_col, skip_rect, border_radius=6)
+            skip_text = self.font_small.render("SKIP", True, COLOR_WHITE)
+            self.screen.blit(skip_text, (skip_rect.centerx - skip_text.get_width() // 2, 
+                                          skip_rect.centery - skip_text.get_height() // 2))
 
     def draw_evolution(self):
         overlay = pygame.Surface((self.w, self.h))
         overlay.set_alpha(220)
         overlay.fill((12, 6, 24))
         self.screen.blit(overlay, (0, 0))
-        title = self.font_large.render("EVOLUTION", True, COLOR_YELLOW)
+        title = self.font_large.render("ULTIMATE UPGRADE", True, COLOR_YELLOW)
         self.screen.blit(title, (self.w // 2 - title.get_width() // 2, self.h // 4))
         w = 320
-        h = 150
+        h = 180  # Taller to fit wrapped text
         gap = 24
         total_w = 3 * w + 2 * gap
         start_x = WIDTH // 2 - total_w // 2
@@ -1706,12 +2955,34 @@ class Game:
             is_hover = rect.collidepoint(mouse_pos)
             col = COLOR_DARK_GRAY if not is_hover else COLOR_GRAY
             pygame.draw.rect(self.screen, col, rect, border_radius=8)
+            
+            # Draw "ULTIMATE" badge at top-left
+            badge = self.font_tiny.render("★ ULTIMATE", True, COLOR_YELLOW)
+            self.screen.blit(badge, (rect.x + 8, rect.y + 8))
+            
             name = evolution_name(eid)
             desc = evolution_desc(eid)
+            
+            # Calculate content height to center vertically
             t1 = self.font_small.render(name, True, COLOR_WHITE)
-            t2 = self.font_tiny.render(desc, True, COLOR_WHITE)
-            self.screen.blit(t1, (rect.centerx - t1.get_width() // 2, rect.y + rect.height // 2 - t1.get_height()))
-            self.screen.blit(t2, (rect.centerx - t2.get_width() // 2, rect.y + rect.height // 2 + 4))
+            name_h = t1.get_height()
+            
+            # Count description lines for height calculation
+            desc_lines = self._get_wrapped_lines(desc, self.font_micro, w - 20)
+            desc_line_h = self.font_micro.get_height() + 2
+            desc_total_h = len(desc_lines) * desc_line_h
+            
+            # Total content height = name + gap + description
+            content_h = name_h + 12 + desc_total_h
+            content_start_y = rect.centery - content_h // 2
+            
+            # Draw name centered horizontally, positioned vertically
+            self.screen.blit(t1, (rect.centerx - t1.get_width() // 2, content_start_y))
+            
+            # Draw wrapped description below name
+            desc_y = content_start_y + name_h + 12
+            max_width = w - 20
+            self._draw_wrapped_text(desc, self.font_micro, rect.centerx, desc_y, max_width, (200, 200, 200))
 
     def draw_game_over(self):
         overlay = pygame.Surface((self.w, self.h))
@@ -1778,7 +3049,7 @@ class Game:
         total_h = option_h * len(WINDOW_SIZES)
         return pygame.Rect(self.btn_window_dropdown.rect.x, self.btn_window_dropdown.rect.bottom + 6, self.btn_window_dropdown.rect.width, total_h)
 
-    def _dev_toggle_rect(self):
+    def _test_toggle_rect(self):
         back = self.btn_settings_back.rect
         w, h = 180, 32
         x = back.centerx - w // 2
@@ -1841,13 +3112,11 @@ class Game:
                 txt = self.font_small.render(f"{w}x{h}", True, COLOR_WHITE)
                 self.screen.blit(txt, (r.x + 10, r.y + r.height // 2 - txt.get_height() // 2))
 
-        # dev toggle aligned with back button
-        dev_rect = self._dev_toggle_rect()
-        toggle_col = COLOR_GREEN if self.dev_mode else COLOR_DARK_GRAY
-        pygame.draw.rect(self.screen, toggle_col, dev_rect, border_radius=6)
-        toggle_txt = self.font_small.render("DEBUG", True, COLOR_WHITE)
-        self.screen.blit(toggle_txt, (dev_rect.x + 12, dev_rect.y + 6))
-        status_txt = self.font_tiny.render("ON" if self.dev_mode else "OFF", True, COLOR_WHITE)
-        self.screen.blit(status_txt, (dev_rect.right - status_txt.get_width() - 10, dev_rect.y + 8))
+        # test mode toggle aligned with back button
+        test_rect = self._test_toggle_rect()
+        toggle_col = COLOR_GREEN if self.test_mode else COLOR_DARK_GRAY
+        pygame.draw.rect(self.screen, toggle_col, test_rect, border_radius=6)
+        toggle_txt = self.font_small.render("TEST MODE", True, COLOR_WHITE)
+        self.screen.blit(toggle_txt, (test_rect.centerx - toggle_txt.get_width() // 2, test_rect.centery - toggle_txt.get_height() // 2))
 
         self.btn_settings_back.draw(self.screen)
