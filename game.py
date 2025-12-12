@@ -3263,3 +3263,11 @@ class Game:
         self.screen.blit(toggle_txt, (test_rect.centerx - toggle_txt.get_width() // 2, test_rect.centery - toggle_txt.get_height() // 2))
 
         self.btn_settings_back.draw(self.screen)
+
+
+def main():
+    Game().run()
+
+
+if __name__ == "__main__":
+    main()
