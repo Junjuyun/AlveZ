@@ -8,6 +8,7 @@ from game_constants import *
 from game_entities import Bullet, Enemy, XPOrb, GasPickup, EvolutionPickup, Player
 from game_powerups import POWERUPS, EVOLUTIONS, apply_powerup, apply_evolution, powerup_name, powerup_desc, evolution_name, evolution_desc, available_powerups
 from game_ui import Button
+import game_ui
 from upgrade_system import UpgradeManager
 from upgrade_trees import UPGRADES_BY_ID, ALL_TREES, get_tier3_upgrades, get_all_effects_for_tier3
 
@@ -18,7 +19,7 @@ class Game:
         pygame.init()
         self.w, self.h = WIDTH, HEIGHT
         self.screen = pygame.display.set_mode((self.w, self.h))
-        pygame.display.set_caption("Space Invaders")
+        pygame.display.set_caption("Space Invaders: Cosmic Ranger")
         self.clock = pygame.time.Clock()
 
         # pixel font (bundled)
@@ -29,14 +30,37 @@ class Game:
             self.font_small = pygame.font.Font(font_path, 20)
             self.font_tiny = pygame.font.Font(font_path, 16)
             self.font_micro = pygame.font.Font(font_path, 12)  # Smaller font for descriptions
+            self.font_menu_title = pygame.font.Font(font_path, 40)  # slightly smaller title for wrapped menu
         else:
             self.font_large = pygame.font.SysFont("PressStart2P", 64)
             self.font_medium = pygame.font.SysFont("PressStart2P", 30)
             self.font_small = pygame.font.SysFont("PressStart2P", 20)
             self.font_tiny = pygame.font.SysFont("PressStart2P", 16)
             self.font_micro = pygame.font.SysFont("PressStart2P", 12)
+            self.font_menu_title = pygame.font.SysFont("PressStart2P", 40)
+
+        # Try loading menu background image (optional). Falls back to starfield if missing.
+        try:
+            img_path = os.path.join(os.path.dirname(__file__), "Assets", "Images", "menu-bg.png")
+            if os.path.isfile(img_path):
+                self.menu_bg_image_original = pygame.image.load(img_path).convert_alpha()
+            else:
+                self.menu_bg_image_original = None
+        except Exception:
+            self.menu_bg_image_original = None
+
+        # Try loading a title image for the main menu (optional). Fallback to text if missing.
+        try:
+            title_path = os.path.join(os.path.dirname(__file__), "Assets", "Images", "game-title.png")
+            if os.path.isfile(title_path):
+                self.game_title_image_original = pygame.image.load(title_path).convert_alpha()
+            else:
+                self.game_title_image_original = None
+        except Exception:
+            self.game_title_image_original = None
 
         self.state = STATE_MENU
+        self.menu_buttons_shift = 0
 
         # Buttons now drawn without rounded corners (pixel look)
         self.btn_start = Button(
@@ -297,8 +321,16 @@ class Game:
                         self.state = STATE_PLAYING
                     else:
                         running = False
+                # Toggle full halt pause with 'P' key: freezes everything without overlay
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_p:
+                    if self.state == STATE_PLAYING:
+                        self.state = STATE_HALT
+                    elif self.state == STATE_HALT:
+                        self.state = STATE_PLAYING
                 self.handle_event(e)
-            self.update(dt)
+            # If halted, skip updates so game world is frozen; still draw the last frame
+            if self.state != STATE_HALT:
+                self.update(dt)
             self.draw()
         pygame.quit()
         sys.exit()
@@ -354,17 +386,32 @@ class Game:
 
     def handle_event(self, e):
         if self.state == STATE_MENU:
-            if self.btn_start.is_clicked(e):
+            # Use the same visual shift applied in draw_menu for accurate hitboxes
+            shift = getattr(self, "menu_buttons_shift", 0)
+            btns = [
+                (self.btn_start, "start"),
+                (self.btn_settings, "settings"),
+                (self.btn_quit, "quit"),
+            ]
+            clicked = None
+            for btn, tag in btns:
+                rect_copy = btn.rect.copy()
+                rect_copy.y += shift
+                if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and rect_copy.collidepoint(e.pos):
+                    clicked = tag
+                    break
+
+            if clicked == "start":
                 audio.play_sfx(audio.snd_menu_click)
                 self.reset_game()
                 if self.test_mode:
                     self.roll_levelup()
                 else:
                     self.state = STATE_PLAYING
-            elif self.btn_settings.is_clicked(e):
+            elif clicked == "settings":
                 audio.play_sfx(audio.snd_menu_click)
                 self.state = STATE_SETTINGS
-            elif self.btn_quit.is_clicked(e):
+            elif clicked == "quit":
                 audio.play_sfx(audio.snd_menu_click)
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
         elif self.state == STATE_GAME_OVER:
@@ -1302,7 +1349,10 @@ class Game:
             return
 
         mx, my = pygame.mouse.get_pos()
-        target = (cam[0] + mx, cam[1] + my)
+        # When the world is zoomed, the render surface is scaled to the screen.
+        # Convert screen mouse coords to world coords by dividing by the current zoom.
+        zoom = clamp(self.view_zoom, 0.7, 1.1)
+        target = (cam[0] + mx / max(0.0001, zoom), cam[1] + my / max(0.0001, zoom))
         px, py = self.player.x, self.player.y
         dx = target[0] - px
         dy = target[1] - py
@@ -1336,6 +1386,12 @@ class Game:
                 en.flash_timer = 0.05
                 en.burn_timer = max(en.burn_timer, 2.0)
                 en.burn_dps = max(en.burn_dps, self.player.damage * 0.18 * self.player.burn_bonus_mult)
+                # Show a brief damage text for the laser hit (rate-limited per enemy)
+                # Use `hit_sources` map to prevent spamming every frame
+                if en.hit_sources.get("laser_text", 0.0) <= 0.0:
+                    dmg = max(1, int(dps * dt + 0.5))
+                    self.damage_texts.append({"x": en.x + 0.0, "y": en.y - 8, "val": dmg, "life": 0.45, "color": COLOR_YELLOW})
+                    en.hit_sources["laser_text"] = 0.18
 
     def _update_minions(self, dt):
         # maintain desired minion count
@@ -2363,6 +2419,11 @@ class Game:
                 surface.blit(flash_surf, (fx - f["r"], fy - f["r"]))
 
     def draw(self):
+        # If halted, don't clear or redraw — keep the last frame exactly as-is
+        if self.state == STATE_HALT:
+            pygame.display.flip()
+            return
+
         self.screen.fill(COLOR_BG)
         if self.state == STATE_MENU:
             self.draw_menu()
@@ -2386,12 +2447,64 @@ class Game:
 
     def draw_menu(self):
         cam = (0, 0)
-        self.draw_background(cam)
-        title = self.font_large.render("SPACE INVADERS", True, COLOR_WHITE)
-        self.screen.blit(title, (self.w // 2 - title.get_width() // 2, self.h // 3 - 40))
-        self.btn_start.draw(self.screen)
-        self.btn_settings.draw(self.screen)
-        self.btn_quit.draw(self.screen)
+        # If a menu background image exists, draw it scaled to the window.
+        if getattr(self, "menu_bg_image_original", None):
+            try:
+                bg = pygame.transform.smoothscale(self.menu_bg_image_original, (self.w, self.h))
+            except Exception:
+                bg = pygame.transform.scale(self.menu_bg_image_original, (self.w, self.h))
+            self.screen.blit(bg, (0, 0))
+        else:
+            self.draw_background(cam)
+        # Render title image if available, centered. Otherwise fallback to wrapped text title.
+        title_img = getattr(self, "game_title_image_original", None)
+        title_block_h = 0
+        if title_img is not None:
+            # scale image to fit within 95% width and 45% height while keeping aspect ratio
+            # allow stronger upscaling (capped) so title can be noticeably larger than the source asset
+            max_w = int(self.w * 0.95)
+            max_h = int(self.h * 0.45)
+            iw, ih = title_img.get_size()
+            # allow up to 3x upscale but prevent excessively large scaling
+            scale = min(max_w / iw, max_h / ih, 3.0)
+            tw = max(1, int(iw * scale))
+            th = max(1, int(ih * scale))
+            try:
+                title_surf = pygame.transform.smoothscale(title_img, (tw, th))
+            except Exception:
+                title_surf = pygame.transform.scale(title_img, (tw, th))
+            title_block_h = title_surf.get_height()
+            tx = self.w // 2 - title_surf.get_width() // 2
+            # move title further up to make room for much larger image
+            ty = self.h // 3 - title_surf.get_height() // 2 - 40
+            self.screen.blit(title_surf, (tx, ty))
+        else:
+            # Render wrapped title (two lines), smaller font, centered
+            title_lines = ["Space Invaders:", "Cosmic Ranger "]
+            rendered_lines = [self.font_menu_title.render(line, True, COLOR_WHITE) for line in title_lines]
+            total_h = sum(surf.get_height() for surf in rendered_lines)
+            title_block_h = total_h
+            # vertical start so the block is roughly where previous single-line title was
+            start_y = self.h // 3 - 40 - total_h // 2
+            for i, surf in enumerate(rendered_lines):
+                x = self.w // 2 - surf.get_width() // 2
+                y = start_y + sum(rendered_lines[j].get_height() for j in range(i))
+                self.screen.blit(surf, (x, y))
+        # Shift buttons down to make room for the larger title image.
+        # Compute a shift based on title height (minimum 40, capped to 260).
+        buttons_shift = max(40, min(60, int(title_block_h * 0.6)))
+        self.menu_buttons_shift = buttons_shift
+        # Temporarily move button rects, draw, then restore original positions.
+        btns = [self.btn_start, self.btn_settings, self.btn_quit]
+        orig_positions = [b.rect.copy() for b in btns]
+        try:
+            for b in btns:
+                b.rect = b.rect.copy()
+                b.rect.y += buttons_shift
+                b.draw(self.screen)
+        finally:
+            for b, r in zip(btns, orig_positions):
+                b.rect = r
 
     def draw_game_world(self):
         # render world to a zoomable surface so boosting shrinks the view
@@ -3058,7 +3171,15 @@ class Game:
 
     def draw_settings(self):
         cam = (0, 0)
-        self.draw_background(cam)
+        # If a menu background image exists, draw it scaled to the window for settings too.
+        if getattr(self, "menu_bg_image_original", None):
+            try:
+                bg = pygame.transform.smoothscale(self.menu_bg_image_original, (self.w, self.h))
+            except Exception:
+                bg = pygame.transform.scale(self.menu_bg_image_original, (self.w, self.h))
+            self.screen.blit(bg, (0, 0))
+        else:
+            self.draw_background(cam)
         overlay = pygame.Surface((self.w, self.h))
         overlay.set_alpha(220)
         overlay.fill((10, 10, 30))
@@ -3112,11 +3233,33 @@ class Game:
                 txt = self.font_small.render(f"{w}x{h}", True, COLOR_WHITE)
                 self.screen.blit(txt, (r.x + 10, r.y + r.height // 2 - txt.get_height() // 2))
 
-        # test mode toggle aligned with back button
+        # test mode toggle aligned with back button - draw using button container assets when available
         test_rect = self._test_toggle_rect()
-        toggle_col = COLOR_GREEN if self.test_mode else COLOR_DARK_GRAY
-        pygame.draw.rect(self.screen, toggle_col, test_rect, border_radius=6)
+        mouse_pos = pygame.mouse.get_pos()
+        is_hover = test_rect.collidepoint(mouse_pos)
+        img = game_ui._BTN_PRESSED if (is_hover or self.test_mode) and getattr(game_ui, '_BTN_PRESSED', None) is not None else getattr(game_ui, '_BTN_IMG', None)
+        if img is not None:
+            # use ninepatch from game_ui
+            try:
+                game_ui._draw_ninepatch(self.screen, img, test_rect, border=12)
+            except Exception:
+                # fallback to solid rect
+                toggle_col = COLOR_GREEN if self.test_mode else COLOR_DARK_GRAY
+                pygame.draw.rect(self.screen, toggle_col, test_rect, border_radius=6)
+        else:
+            toggle_col = COLOR_GREEN if self.test_mode else COLOR_DARK_GRAY
+            pygame.draw.rect(self.screen, toggle_col, test_rect, border_radius=6)
+
+        # scaled label similar to Button
+        BUTTON_TEXT_SCALE = 0.80
         toggle_txt = self.font_small.render("TEST MODE", True, COLOR_WHITE)
+        if BUTTON_TEXT_SCALE != 1.0:
+            new_w = max(1, int(toggle_txt.get_width() * BUTTON_TEXT_SCALE))
+            new_h = max(1, int(toggle_txt.get_height() * BUTTON_TEXT_SCALE))
+            try:
+                toggle_txt = pygame.transform.smoothscale(toggle_txt, (new_w, new_h))
+            except Exception:
+                toggle_txt = pygame.transform.scale(toggle_txt, (new_w, new_h))
         self.screen.blit(toggle_txt, (test_rect.centerx - toggle_txt.get_width() // 2, test_rect.centery - toggle_txt.get_height() // 2))
 
         self.btn_settings_back.draw(self.screen)
