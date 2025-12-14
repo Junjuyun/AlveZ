@@ -18,7 +18,8 @@ class Game:
     def __init__(self):
         pygame.init()
         self.w, self.h = WIDTH, HEIGHT
-        self.screen = pygame.display.set_mode((self.w, self.h))
+        self.window = pygame.display.set_mode((self.w, self.h))
+        self.screen = self.window
         pygame.display.set_caption("Space Invaders: Cosmic Ranger")
         self.clock = pygame.time.Clock()
 
@@ -219,6 +220,52 @@ class Game:
         self._load_audio_assets()
         self._update_music(0)
 
+    def _get_desktop_size(self):
+        try:
+            sizes = pygame.display.get_desktop_sizes()
+            if sizes:
+                return sizes[0]
+        except Exception:
+            pass
+        try:
+            info = pygame.display.Info()
+            return (int(info.current_w), int(info.current_h))
+        except Exception:
+            return (self.w, self.h)
+
+    def _present_transform(self):
+        """Compute scale + letterbox offsets for presenting logical surface to the window."""
+        if self.screen is self.window:
+            ww, wh = self.window.get_size()
+            return 1.0, 0, 0, ww, wh
+
+        ww, wh = self.window.get_size()
+        scale = min(ww / max(1, self.w), wh / max(1, self.h))
+        dst_w = max(1, int(self.w * scale))
+        dst_h = max(1, int(self.h * scale))
+        ox = (ww - dst_w) // 2
+        oy = (wh - dst_h) // 2
+        return scale, ox, oy, dst_w, dst_h
+
+    def _to_logical_pos(self, pos):
+        """Map window-space mouse positions to logical game-space positions."""
+        if self.screen is self.window:
+            return pos
+
+        mx, my = pos
+        scale, ox, oy, dst_w, dst_h = self._present_transform()
+        mx -= ox
+        my -= oy
+        if mx < 0 or my < 0 or mx >= dst_w or my >= dst_h:
+            return None
+        lx = int(mx / max(0.0001, scale))
+        ly = int(my / max(0.0001, scale))
+        return (clamp(lx, 0, self.w - 1), clamp(ly, 0, self.h - 1))
+
+    def _mouse_pos(self):
+        p = self._to_logical_pos(pygame.mouse.get_pos())
+        return p if p is not None else (-1, -1)
+
     def _load_audio_assets(self):
         base = os.path.join(os.path.dirname(__file__), "Assets", "Sounds")
 
@@ -358,8 +405,43 @@ class Game:
     def _apply_display_mode(self):
         global WIDTH, HEIGHT
         WIDTH, HEIGHT = self.w, self.h
-        flags = pygame.FULLSCREEN if self.fullscreen else 0
-        self.screen = pygame.display.set_mode((self.w, self.h), flags)
+        # Borderless-windowed fullscreen (NOT exclusive fullscreen):
+        # - Fast alt-tab
+        # - OBS capture is more reliable than exclusive fullscreen
+        # - Preserves the existing 1280x720 (or selected) look by rendering to a
+        #   logical surface and scaling to the desktop window.
+        if self.fullscreen:
+            desk_w, desk_h = self._get_desktop_size()
+            # Hint SDL/Windows to place the borderless window at the top-left.
+            # (Some systems ignore set_window_position unless this is set before set_mode.)
+            try:
+                os.environ["SDL_VIDEO_CENTERED"] = "0"
+                os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
+            except Exception:
+                pass
+            try:
+                self.window = pygame.display.set_mode((desk_w, desk_h), pygame.NOFRAME)
+            except pygame.error:
+                self.window = pygame.display.set_mode((desk_w, desk_h), 0)
+
+            if hasattr(pygame.display, "set_window_position"):
+                try:
+                    pygame.display.set_window_position(0, 0)
+                except Exception:
+                    pass
+
+            # Some setups need an explicit resize after positioning to fully cover the desktop.
+            if hasattr(pygame.display, "set_window_size"):
+                try:
+                    pygame.display.set_window_size((desk_w, desk_h))
+                except Exception:
+                    pass
+
+            # Offscreen logical surface (keeps UI/layout identical to your current fullscreen scaling)
+            self.screen = pygame.Surface((self.w, self.h)).convert()
+        else:
+            self.window = pygame.display.set_mode((self.w, self.h), 0)
+            self.screen = self.window
         self._rebuild_ui()
         # update sliders position
         slider_w = 300
@@ -385,6 +467,17 @@ class Game:
         return title_y
 
     def handle_event(self, e):
+        # In borderless fullscreen we render to a logical surface and scale to the desktop.
+        # Translate mouse coordinates so clicks/aiming are not offset.
+        if self.screen is not self.window and hasattr(e, "pos"):
+            mapped = self._to_logical_pos(e.pos)
+            if mapped is None:
+                return
+            try:
+                e = pygame.event.Event(e.type, {**e.dict, "pos": mapped})
+            except Exception:
+                pass
+
         if self.state == STATE_MENU:
             # Use the same visual shift applied in draw_menu for accurate hitboxes
             shift = getattr(self, "menu_buttons_shift", 0)
@@ -743,7 +836,7 @@ class Game:
 
         # shooting
         if pygame.mouse.get_pressed()[0] and self.player.can_shoot():
-            mx, my = pygame.mouse.get_pos()
+            mx, my = self._mouse_pos()
             # Adjust mouse position for zoom - screen center is player position
             center_x, center_y = self.w / 2, self.h / 2
             # Mouse offset from center, scaled by zoom
@@ -1348,7 +1441,7 @@ class Game:
             self.laser_segment = None
             return
 
-        mx, my = pygame.mouse.get_pos()
+        mx, my = self._mouse_pos()
         # When the world is zoomed, the render surface is scaled to the screen.
         # Convert screen mouse coords to world coords by dividing by the current zoom.
         zoom = clamp(self.view_zoom, 0.7, 1.1)
@@ -2443,7 +2536,16 @@ class Game:
                 self.draw_pause_overlay()
         elif self.state == STATE_SETTINGS:
             self.draw_settings()
-        pygame.display.flip()
+
+        # Present to the actual window (desktop-sized when borderless fullscreen).
+        if self.screen is self.window:
+            pygame.display.flip()
+        else:
+            self.window.fill((0, 0, 0))
+            _, ox, oy, dst_w, dst_h = self._present_transform()
+            frame = pygame.transform.smoothscale(self.screen, (dst_w, dst_h))
+            self.window.blit(frame, (ox, oy))
+            pygame.display.flip()
 
     def draw_menu(self):
         cam = (0, 0)
@@ -2747,7 +2849,7 @@ class Game:
             render_surf.blit(flash, (start[0] - burst_r, start[1] - burst_r))
         # Glare cone visual
         if getattr(self.player, "glare_dps", 0) > 0:
-            mx, my = pygame.mouse.get_pos()
+            mx, my = self._mouse_pos()
             glare_range = 300
             glare_cone = 0.5
             aim_dx = mx - render_w // 2
@@ -2777,7 +2879,7 @@ class Game:
                 render_surf.blit(glare_surf, (0, 0))
         
         # Calculate aim angle accounting for zoom
-        mx, my = pygame.mouse.get_pos()
+        mx, my = self._mouse_pos()
         # Convert screen mouse coords to render surface coords
         screen_center_x = self.w // 2
         screen_center_y = self.h // 2
@@ -2994,7 +3096,7 @@ class Game:
         total_w = 3 * w + 2 * gap
         start_x = WIDTH // 2 - total_w // 2
         y = HEIGHT // 2 - h // 2
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         for i, uid in enumerate(self.levelup_options):
             rect = pygame.Rect(start_x + i * (w + gap), y, w, h)
             is_hover = rect.collidepoint(mouse_pos)
@@ -3062,7 +3164,7 @@ class Game:
         total_w = 3 * w + 2 * gap
         start_x = WIDTH // 2 - total_w // 2
         y = HEIGHT // 2 - h // 2
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         for i, eid in enumerate(self.evolution_options):
             rect = pygame.Rect(start_x + i * (w + gap), y, w, h)
             is_hover = rect.collidepoint(mouse_pos)
@@ -3235,7 +3337,7 @@ class Game:
 
         # test mode toggle aligned with back button - draw using button container assets when available
         test_rect = self._test_toggle_rect()
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._mouse_pos()
         is_hover = test_rect.collidepoint(mouse_pos)
         img = game_ui._BTN_PRESSED if (is_hover or self.test_mode) and getattr(game_ui, '_BTN_PRESSED', None) is not None else getattr(game_ui, '_BTN_IMG', None)
         if img is not None:

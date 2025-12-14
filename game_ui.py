@@ -3,6 +3,84 @@ import pygame
 from game_constants import COLOR_WHITE
 
 
+# --- input coordinate transform (window -> game logical coords) ---
+_VIEW = {
+    "game_w": None,
+    "game_h": None,
+    "win_w": None,
+    "win_h": None,
+    "scale": 1.0,
+    "ox": 0.0,
+    "oy": 0.0,
+}
+
+
+def set_view_transform(game_w: int, game_h: int, win_w: int, win_h: int, cover: bool = False):
+    """Configure how window pixels map to game logical coordinates.
+
+    This keeps mouse hover/click accurate when the window is scaled (e.g.
+    borderless fullscreen windowed).
+    """
+    game_w = int(game_w)
+    game_h = int(game_h)
+    win_w = int(win_w)
+    win_h = int(win_h)
+    if game_w <= 0 or game_h <= 0 or win_w <= 0 or win_h <= 0:
+        return
+
+    # By default we fit the game area inside the window. When `cover=True` we
+    # scale up to fully cover the window (may crop edges) which is useful for
+    # borderless fullscreen to avoid letterboxing and visual offsets.
+    if cover:
+        scale = max(win_w / game_w, win_h / game_h)
+    else:
+        scale = min(win_w / game_w, win_h / game_h)
+    scaled_w = game_w * scale
+    scaled_h = game_h * scale
+    ox = (win_w - scaled_w) * 0.5
+    oy = (win_h - scaled_h) * 0.5
+
+    _VIEW.update({
+        "game_w": game_w,
+        "game_h": game_h,
+        "win_w": win_w,
+        "win_h": win_h,
+        "scale": float(scale),
+        "ox": float(ox),
+        "oy": float(oy),
+    })
+
+
+def map_point(pos):
+    """Map a (x,y) point from window space to game logical space.
+
+    Returns a far-off point if the cursor is in letterbox bars.
+    """
+    if not pos:
+        return (-10**9, -10**9)
+    x, y = pos
+    gw, gh = _VIEW.get("game_w"), _VIEW.get("game_h")
+    ww, wh = _VIEW.get("win_w"), _VIEW.get("win_h")
+    if gw is None or gh is None or ww is None or wh is None:
+        return (x, y)
+
+    scale = _VIEW.get("scale", 1.0) or 1.0
+    ox = _VIEW.get("ox", 0.0)
+    oy = _VIEW.get("oy", 0.0)
+
+    # Outside the scaled game area? Treat as "not hovering".
+    if x < ox or y < oy or x >= ox + gw * scale or y >= oy + gh * scale:
+        return (-10**9, -10**9)
+
+    gx = int((x - ox) / scale)
+    gy = int((y - oy) / scale)
+    return (gx, gy)
+
+
+def get_mouse_pos():
+    return map_point(pygame.mouse.get_pos())
+
+
 # Try loading button container assets once at module import
 _ASSET_DIR = os.path.join(os.path.dirname(__file__), "Assets", "Images")
 _BTN_IMG_PATH = os.path.join(_ASSET_DIR, "button_container.png")
@@ -88,7 +166,7 @@ class Button:
         self.active_color = active_color or hover_color
 
     def draw(self, surf):
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = get_mouse_pos()
         is_hover = self.rect.collidepoint(mouse_pos)
         is_pressed = is_hover and pygame.mouse.get_pressed()[0]
 
@@ -120,8 +198,9 @@ class Button:
         )
 
     def is_clicked(self, event):
+        mapped = map_point(getattr(event, "pos", None))
         return (
             event.type == pygame.MOUSEBUTTONDOWN
             and event.button == 1
-            and self.rect.collidepoint(event.pos)
+            and self.rect.collidepoint(mapped)
         )
