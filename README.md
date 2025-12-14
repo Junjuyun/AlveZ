@@ -273,11 +273,7 @@ git clone https://github.com/Junjuyun/G.git
 pip install pygame
 
 # Run the game
-python "game.py"
-
-# Fullscreen note (Windows)
-# The in-game FULLSCREEN toggle uses borderless-windowed fullscreen (scaled)
-# to reduce alt-tab lag and improve OBS capture compatibility.
+python "Space Invaders.py"
 ```
 
 ---
@@ -285,7 +281,7 @@ python "game.py"
 ## 📁 Project Structure
 
 ```
-├── Space Invaders.py    # Legacy entry point (optional)
+├── Space Invaders.py    # Entry point
 ├── game.py              # Main game loop & logic
 ├── game_entities.py     # Player, Enemy, Bullet classes
 ├── game_combat.py       # Combat calculations
